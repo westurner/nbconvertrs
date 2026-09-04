@@ -142,21 +142,19 @@ pub fn markdown_to_notebook(
             let source = source;
             let metadata = metadata.unwrap_or_default();
             let id = cell_id(index);
-            match cell_type {
-                CellTypeTag::Markdown => cells.push(Cell::Markdown {
+            if cell_type == CellTypeTag::Raw {
+                cells.push(Cell::Raw {
+                    id,
+                    metadata,
+                    source: split_source(&source),
+                });
+            } else {
+                cells.push(Cell::Markdown {
                     id,
                     metadata,
                     source: split_source(&source),
                     attachments: None,
-                }),
-                CellTypeTag::Raw => cells.push(Cell::Raw {
-                    id,
-                    metadata,
-                    source: split_source(&source),
-                }),
-                CellTypeTag::Code => {
-                    unreachable!("HTML regions only describe Markdown or raw cells")
-                }
+                });
             }
             index += 1;
             line_index += 1;
@@ -328,12 +326,11 @@ pub fn script_to_notebook(
 /// Render an nbformat v4 notebook in Jupytext Markdown form.
 pub fn notebook_to_markdown(notebook: &NotebookV4) -> String {
     let mut output = String::new();
-    if let Ok(metadata) = serde_yaml::to_string(&notebook.metadata) {
-        if metadata.trim() != "{}" {
-            output.push_str("---\n");
-            output.push_str(&metadata);
-            output.push_str("---\n\n");
-        }
+    let metadata = serde_yaml::to_string(&notebook.metadata).unwrap();
+    if metadata.trim() != "{}" {
+        output.push_str("---\n");
+        output.push_str(&metadata);
+        output.push_str("---\n\n");
     }
     for (index, cell) in notebook.cells.iter().enumerate() {
         if index > 0 && !output.ends_with("\n\n") {
@@ -400,17 +397,16 @@ pub fn notebook_to_script(notebook: &NotebookV4, format: &str, language: &str) -
     };
     let end_marker = format!("{comment_prefix} -");
     let mut output = String::new();
-    if let Ok(metadata) = serde_yaml::to_string(&notebook.metadata) {
-        if metadata.trim() != "{}" {
-            for line in metadata.lines() {
-                output.push_str(comment_prefix);
-                output.push(' ');
-                output.push_str(line);
-                output.push('\n');
-            }
-            output.insert_str(0, &format!("{comment_prefix} ---\n"));
-            output.push_str(&format!("{comment_prefix} ---\n\n"));
+    let metadata = serde_yaml::to_string(&notebook.metadata).unwrap();
+    if metadata.trim() != "{}" {
+        for line in metadata.lines() {
+            output.push_str(comment_prefix);
+            output.push(' ');
+            output.push_str(line);
+            output.push('\n');
         }
+        output.insert_str(0, &format!("{comment_prefix} ---\n"));
+        output.push_str(&format!("{comment_prefix} ---\n\n"));
     }
     for (index, cell) in notebook.cells.iter().enumerate() {
         if index > 0 {
@@ -1433,5 +1429,301 @@ mod tests {
             config.manifest,
             directory.path().join(".tmp/workflow/chat-manifest.json")
         );
+    }
+
+    #[test]
+    fn covers_parser_errors_and_alternate_cell_writers() {
+        assert!(markdown_to_notebook(
+            "<!-- #region -->\nbody\n",
+            &TransformOptions::default()
+        )
+        .is_err());
+        assert!(markdown_to_notebook(
+            "---\nnot: [closed\n---\n",
+            &TransformOptions::default()
+        )
+        .is_err());
+        assert!(markdown_to_notebook(
+            "---\n- list\n---\n",
+            &TransformOptions::default()
+        )
+        .is_err());
+        assert!(markdown_to_notebook(
+            "<!-- #region invalid -->\nbody\n<!-- #endregion -->\n",
+            &TransformOptions::default()
+        )
+        .is_err());
+        assert!(markdown_to_notebook(
+            "```python\n---\n- list\n---\ncode\n```\n",
+            &TransformOptions::default()
+        )
+        .is_err());
+        assert!(markdown_to_notebook(
+            "```python\n---\ntags: [one]\ncode\n",
+            &TransformOptions::default()
+        )
+        .is_err());
+        assert!(markdown_to_notebook(
+            "```python\n---\ntags: [one]\n```\n",
+            &TransformOptions::default()
+        )
+        .is_err());
+        assert!(markdown_to_notebook("---\nname: value\n", &TransformOptions::default()).is_err());
+        assert!(markdown_to_notebook("<!-- regular -->\n", &TransformOptions::default()).is_ok());
+        assert!(region_start("<!-- #region").unwrap().is_none());
+        assert!(region_start("<!-- #unknown -->").unwrap().is_none());
+        assert!(!region_end("<!-- #endregion", CellTypeTag::Markdown));
+        assert!(!region_end("<!-- #endmarkdown -->", CellTypeTag::Code));
+        assert!(metadata_from_value(serde_json::Value::Null).is_err());
+        assert_eq!(
+            parse_script_options("{\"name\":\"named\"}").1.name.as_deref(),
+            Some("named")
+        );
+        assert_eq!(
+            parse_script_options("{invalid}").1.name.as_deref(),
+            Some("{invalid}")
+        );
+        let mut language_metadata = CellMetadata::default();
+        language_metadata
+            .additional
+            .insert("language".into(), serde_json::json!("python"));
+        let mut rendered = String::new();
+        append_myst_metadata(&mut rendered, &language_metadata);
+        assert!(rendered.is_empty());
+        assert_eq!(
+            html_region_start("region", &CellMetadata::default()),
+            "<!-- #region -->"
+        );
+
+        let notebook = markdown_to_notebook(
+            "~~~raw\nraw\n~~~\n\n```python\n:tags: [example]\nprint(1)\n```\n",
+            &TransformOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(notebook.cells[0], Cell::Raw { .. }));
+        assert!(notebook_to_markdown(&notebook).contains("raw"));
+        assert!(notebook_to_script(&notebook, "light", "r").contains("# + [raw]"));
+        assert!(notebook_to_script(&notebook, "percent", "julia").contains("# %%"));
+        assert!(notebook_to_script(&notebook, "light", "matlab").contains("% +"));
+        let code_with_metadata = markdown_to_notebook(
+            "```python\n:tags: [code]\nvalue = 1\n```\n",
+            &TransformOptions::default(),
+        )
+        .unwrap();
+        assert!(notebook_to_script(&code_with_metadata, "light", "python").contains("tags"));
+        assert!(markdown_to_notebook(
+            "<!-- #markdown -->\ntext\n<!-- #endmarkdown -->\n",
+            &TransformOptions::default(),
+        )
+        .is_ok());
+        assert!(split_source("").is_empty());
+        assert!(script_to_notebook("# -\n", "light", "python").unwrap().cells.is_empty());
+
+        let raw_json = r##"{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"raw","metadata":{},"source":"raw"}]}"##;
+        let raw = match nbformat::parse_notebook(raw_json).unwrap() {
+            Notebook::V4QuirksMode(notebook) => notebook.repair(),
+            _ => panic!("expected a repaired v4 notebook"),
+        };
+        assert!(notebook_to_markdown(&raw).contains("```{raw-cell}"));
+        let markdown_json = r##"{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"markdown","id":"cell-0","metadata":{},"source":"text"}]}"##;
+        let markdown = match nbformat::parse_notebook(markdown_json).unwrap() {
+            Notebook::V4(notebook) => notebook,
+            _ => panic!("expected a v4 notebook"),
+        };
+        assert_eq!(notebook_to_markdown(&markdown), "text\n");
+        let code_json = r##"{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"code","id":"cell-0","metadata":{},"execution_count":null,"source":"value = 1","outputs":[] }]}"##;
+        let code = match nbformat::parse_notebook(code_json).unwrap() {
+            Notebook::V4(notebook) => notebook,
+            _ => panic!("expected a v4 notebook"),
+        };
+        assert!(notebook_to_script(&code, "light", "python").contains("value = 1\n"));
+    }
+
+    #[test]
+    fn covers_script_edge_cases_and_dispatch_formats() {
+        assert!(script_to_notebook("# ---\n# broken\n", "percent", "python").is_err());
+        assert!(script_to_notebook("# ---\n# - list\n# ---\n", "percent", "python").is_err());
+        let light = script_to_notebook(
+            "preamble = 1\n# +\nvalue = 2\n# -\n# + [markdown]\n# text\n# -\n",
+            "light",
+            "python",
+        )
+        .unwrap();
+        assert_eq!(light.cells.len(), 3);
+        let plain = script_to_notebook("value = 1\n", "light", "python").unwrap();
+        assert_eq!(plain.cells.len(), 1);
+        assert!(script_to_notebook("# %%not-a-marker\nvalue = 1\n", "percent", "python")
+            .unwrap()
+            .cells
+            .iter()
+            .any(|cell| matches!(cell, Cell::Code { .. })));
+        let marker_metadata = script_to_notebook(
+            "# %% {invalid-json}\nvalue = 1\n",
+            "percent",
+            "python",
+        )
+        .unwrap();
+        assert_eq!(marker_metadata.cells[0].metadata().name.as_deref(), Some("{invalid-json}"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("input.md");
+        let output = directory.path().join("nested/converted");
+        fs::write(&source, "# Title\n\n```python\nprint(1)\n```\n").unwrap();
+        let formats = [
+            "md", "markdown", "notebook", "py:light", "R:percent", "jl:light", "m:light",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+        let results = transform_file(&source, &output, &formats, &TransformOptions::default())
+            .unwrap();
+        assert_eq!(results.len(), formats.len());
+        assert!(output.with_extension("myst.md").is_file());
+        assert!(output.with_extension("ipynb").is_file());
+        assert!(output.with_extension("R").is_file());
+        assert!(output.with_extension("jl").is_file());
+        assert!(output.with_extension("m").is_file());
+        assert!(transform_file(&source, &output, &["unsupported".into()], &TransformOptions::default())
+            .is_err());
+
+        for (extension, source_text) in [
+            ("py", "value = 1\n"),
+            ("R", "value <- 1\n"),
+            ("jl", "value = 1\n"),
+            ("m", "value = 1\n"),
+        ] {
+            let script_source = directory.path().join(format!("input.{extension}"));
+            fs::write(&script_source, source_text).unwrap();
+            transform_file(
+                &script_source,
+                &output,
+                &["myst".into()],
+                &TransformOptions::default(),
+            )
+            .unwrap();
+        }
+        let percent_source = directory.path().join("input.py");
+        fs::write(&percent_source, "# %%\nvalue = 1\n").unwrap();
+        transform_file(
+            &percent_source,
+            &output,
+            &["myst".into()],
+            &TransformOptions::default(),
+        )
+        .unwrap();
+
+        let dispatch = directory.path().join("dispatch.ipynb");
+        fs::write(
+            &dispatch,
+            r##"{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"markdown","metadata":{},"source":"text"}]}"##,
+        )
+        .unwrap();
+        transform_file(&dispatch, &output, &[], &TransformOptions::default()).unwrap();
+        fs::write(
+            &dispatch,
+            r##"{"nbformat":4,"nbformat_minor":0,"metadata":{},"cells":[]}"##,
+        )
+        .unwrap();
+        transform_file(&dispatch, &output, &[], &TransformOptions::default()).unwrap();
+        fs::write(
+            &dispatch,
+            r##"{"nbformat":3,"nbformat_minor":0,"metadata":{},"worksheets":[]}"##,
+        )
+        .unwrap();
+        transform_file(&dispatch, &output, &[], &TransformOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn covers_workflow_config_and_manifest_fallbacks() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.yml");
+        fs::write(&config_path, "not: a workflow\n").unwrap();
+        assert!(load_workflow_config(&config_path).is_err());
+        fs::write(&config_path, "[invalid\n").unwrap();
+        assert!(load_workflow_config(&config_path).is_err());
+        fs::write(&config_path, "output_formats: [myst]\nmanifest: ./manifest.json\n").unwrap();
+        let config = load_workflow_config(&config_path).unwrap();
+        assert_eq!(config.manifest, directory.path().join("manifest.json"));
+        let absolute_manifest = directory.path().join("absolute.json");
+        fs::write(
+            &config_path,
+            format!("output_formats: [myst]\nmanifest: {}\n", absolute_manifest.display()),
+        )
+        .unwrap();
+        assert_eq!(load_workflow_config(&config_path).unwrap().manifest, absolute_manifest);
+
+        let source_root = directory.path().join("source");
+        let output_dir = directory.path().join("output");
+        fs::create_dir_all(&source_root).unwrap();
+        let source = source_root.join("note.md");
+        fs::write(&source, "# Title\n").unwrap();
+        let manifest_path = directory.path().join("manifest.json");
+        let manifest = TransformManifest {
+            source_root: source_root.clone(),
+            output_dir: output_dir.clone(),
+            transform_fingerprint: "fingerprint".into(),
+            files: BTreeMap::from([(
+                "note.md".into(),
+                ManifestFile {
+                    source: "note.md".into(),
+                    sha256: sha256_path(&source).unwrap(),
+                    outputs: BTreeMap::new(),
+                    ..ManifestFile::default()
+                },
+            )]),
+            ..TransformManifest::default()
+        };
+        fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(transform_manifest(&manifest_path, true).unwrap().transformed, 1);
+        assert!(transform_manifest(&manifest_path, false).is_err());
+
+        let successful_manifest = TransformManifest {
+            output_formats: vec!["myst".into()],
+            files: BTreeMap::from([(
+                "note.md".into(),
+                ManifestFile {
+                    source: "note.md".into(),
+                    sha256: sha256_path(&source).unwrap(),
+                    outputs: BTreeMap::from([(
+                        "myst".into(),
+                        output_dir.join("note.myst.md").to_string_lossy().into_owned(),
+                    )]),
+                    ..ManifestFile::default()
+                },
+            )]),
+            ..manifest.clone()
+        };
+        fs::write(&manifest_path, serde_json::to_string(&successful_manifest).unwrap()).unwrap();
+        assert_eq!(transform_manifest(&manifest_path, false).unwrap().transformed, 1);
+
+        let error_manifest = TransformManifest {
+            output_formats: vec!["unsupported".into()],
+            files: BTreeMap::from([(
+                "note.md".into(),
+                ManifestFile {
+                    source: "note.md".into(),
+                    sha256: sha256_path(&source).unwrap(),
+                    outputs: BTreeMap::from([("unsupported".into(), "ignored".into())]),
+                    ..ManifestFile::default()
+                },
+            )]),
+            ..manifest.clone()
+        };
+        fs::write(&manifest_path, serde_json::to_string(&error_manifest).unwrap()).unwrap();
+        assert!(transform_manifest(&manifest_path, false).is_err());
+
+        let default_manifest = TransformManifest {
+            output_formats: Vec::new(),
+            files: BTreeMap::new(),
+            ..manifest
+        };
+        fs::write(&manifest_path, serde_json::to_string(&default_manifest).unwrap()).unwrap();
+        assert_eq!(transform_manifest(&manifest_path, false).unwrap().transformed, 0);
+        let parsed: TransformManifest = serde_json::from_str(
+            &serde_json::json!({"source_root":"source","output_dir":"output","files":{}})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(parsed.version, 1);
     }
 }
