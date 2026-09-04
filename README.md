@@ -124,6 +124,16 @@ output formats return `TransformError::UnsupportedFormat` so callers can
 choose a Python/Jupytext fallback when their workflow requires a broader
 format matrix.
 
-The transform crate is nested under sustainablefactory in the dsport
-workspace. Changes here must be committed in this repository before the
-sustainablefactory parent can update its submodule pointer.
+## Citation
+
+This project follows the text-notebook formats and conventions established by
+`ipython nbconvert` and Jupytext:
+
+> "Jupytext: Jupyter notebooks as Markdown documents, Julia, Python or R
+> scripts." [Jupytext project](https://github.com/jupytext/jupytext).
+
+
+## License
+
+`nbconvertrs` is distributed under the [BSD-3-Clause license](LICENSE). The
+license text follows the [runtimed BSD-3-Clause license](https://github.com/runtimed/runtimed#BSD-3-Clause-1-ov-file).

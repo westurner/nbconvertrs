@@ -3,7 +3,7 @@ name = "nbconvertrs"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-license = "BSD-2-Clause"
+license = "BSD-3-Clause"
 description = "Optional Markdown and Jupyter notebook transforms for DocIndex"
 
 [[bin]]
