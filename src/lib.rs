@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nbformat::Notebook;
-use nbformat::v4::{Cell, CellId, CellMetadata, Notebook as NotebookV4};
+use nbformat::v4::{Cell, CellId, CellMetadata, Notebook as NotebookV4, Output};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -43,6 +43,34 @@ pub enum TransformError {
     UnsupportedFormat(String),
 }
 
+/// Stable categories for errors returned by the conversion pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCode {
+    /// Filesystem access failed.
+    Io,
+    /// Notebook parsing, upgrading, or validation failed.
+    Notebook,
+    /// JSON serialization or deserialization failed.
+    Json,
+    /// Input or configuration was invalid.
+    Configuration,
+    /// The requested format is not supported.
+    UnsupportedFormat,
+}
+
+impl TransformError {
+    /// Return a machine-readable category for this error.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::Io(_) => ErrorCode::Io,
+            Self::Notebook(_) => ErrorCode::Notebook,
+            Self::Json(_) => ErrorCode::Json,
+            Self::Configuration(_) => ErrorCode::Configuration,
+            Self::UnsupportedFormat(_) => ErrorCode::UnsupportedFormat,
+        }
+    }
+}
+
 /// A normalized format requested by a caller or detected from a path.
 ///
 /// Use [`FormatId::parse`] at API boundaries. The parser accepts canonical
@@ -56,6 +84,14 @@ pub enum FormatId {
     Notebook,
     /// Static HTML source rendering.
     Html,
+    /// One-way reStructuredText source rendering.
+    Rst,
+    /// One-way AsciiDoc source rendering.
+    AsciiDoc,
+    /// Quarto-flavored Markdown source rendering.
+    Quarto,
+    /// Pandoc-oriented Markdown source rendering.
+    Pandoc,
     /// A Jupytext-style script with a language-specific comment prefix.
     Script {
         /// Canonical name of the script language.
@@ -64,6 +100,12 @@ pub enum FormatId {
         kind: ScriptKind,
     },
 }
+
+/// Input-format spelling retained as an explicit API concept.
+pub type InputFormat = FormatId;
+
+/// Output-format spelling retained as an explicit API concept.
+pub type OutputFormat = FormatId;
 
 /// The cell-marker convention used by a script format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -180,6 +222,30 @@ const FORMAT_DESCRIPTORS: &[FormatDescriptor] = &[
         extensions: &["html"],
         round_trip: false,
     },
+    FormatDescriptor {
+        name: "rst",
+        aliases: &["rest"],
+        extensions: &["rst", "rest"],
+        round_trip: false,
+    },
+    FormatDescriptor {
+        name: "asciidoc",
+        aliases: &["adoc"],
+        extensions: &["adoc", "asciidoc"],
+        round_trip: false,
+    },
+    FormatDescriptor {
+        name: "quarto",
+        aliases: &["qmd"],
+        extensions: &["qmd"],
+        round_trip: false,
+    },
+    FormatDescriptor {
+        name: "pandoc",
+        aliases: &[],
+        extensions: &["md"],
+        round_trip: false,
+    },
 ];
 
 /// Return descriptors for the built-in non-language-specific formats.
@@ -197,6 +263,10 @@ impl FormatId {
             "myst" | "md" | "markdown" => Ok(Self::Markdown),
             "ipynb" | "notebook" => Ok(Self::Notebook),
             "html" => Ok(Self::Html),
+            "rst" | "rest" => Ok(Self::Rst),
+            "asciidoc" | "adoc" => Ok(Self::AsciiDoc),
+            "quarto" | "qmd" => Ok(Self::Quarto),
+            "pandoc" => Ok(Self::Pandoc),
             _ => {
                 let Some((language, kind)) = value.split_once(':') else {
                     return Err(TransformError::UnsupportedFormat(value.into()));
@@ -222,6 +292,10 @@ impl FormatId {
             Self::Markdown => "myst".into(),
             Self::Notebook => "ipynb".into(),
             Self::Html => "html".into(),
+            Self::Rst => "rst".into(),
+            Self::AsciiDoc => "asciidoc".into(),
+            Self::Quarto => "quarto".into(),
+            Self::Pandoc => "pandoc".into(),
             Self::Script { language, kind } => format!(
                 "{}:{}",
                 language,
@@ -238,6 +312,10 @@ impl FormatId {
             Self::Markdown => "myst.md".into(),
             Self::Notebook => "ipynb".into(),
             Self::Html => "html".into(),
+            Self::Rst => "rst".into(),
+            Self::AsciiDoc => "adoc".into(),
+            Self::Quarto => "qmd".into(),
+            Self::Pandoc => "md".into(),
             Self::Script { language, .. } => language_spec(language)
                 .and_then(|spec| spec.extensions.first().copied())
                 .unwrap_or(language)
@@ -269,6 +347,57 @@ pub struct ResourceBundle {
     pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
+/// A notebook plus resources collected during conversion.
+#[derive(Debug, Clone)]
+pub struct NotebookDocument {
+    /// Canonical notebook model.
+    pub notebook: NotebookV4,
+    /// Resources associated with the notebook.
+    pub resources: ResourceBundle,
+}
+
+impl NotebookDocument {
+    /// Create a document with an empty resource bundle.
+    pub fn new(notebook: NotebookV4) -> Self {
+        Self {
+            notebook,
+            resources: ResourceBundle::default(),
+        }
+    }
+}
+
+/// Text content entering or leaving the conversion pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextDocument {
+    /// Text body, normalized to UTF-8.
+    pub body: String,
+    /// Format that produced or is expected to consume the body.
+    pub format: FormatId,
+    /// Resources referenced by the body.
+    pub resources: ResourceBundle,
+}
+
+/// Policies controlling which notebook data is retained during export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportOptions {
+    /// Collect binary display outputs and cell attachments.
+    pub extract_resources: bool,
+    /// Keep code-cell outputs in source-oriented export processing.
+    pub retain_outputs: bool,
+    /// Keep execution counts in source-oriented export processing.
+    pub retain_execution_counts: bool,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            extract_resources: true,
+            retain_outputs: true,
+            retain_execution_counts: true,
+        }
+    }
+}
+
 /// The body and resources produced by an in-memory export.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportResult {
@@ -295,12 +424,21 @@ pub trait Exporter {
 #[derive(Debug, Clone)]
 pub struct BasicExporter {
     format: FormatId,
+    options: ExportOptions,
 }
 
 impl BasicExporter {
     /// Construct an exporter for a normalized format.
     pub fn new(format: FormatId) -> Self {
-        Self { format }
+        Self {
+            format,
+            options: ExportOptions::default(),
+        }
+    }
+
+    /// Construct an exporter with explicit output retention and resource policies.
+    pub fn with_options(format: FormatId, options: ExportOptions) -> Self {
+        Self { format, options }
     }
 }
 
@@ -310,13 +448,40 @@ impl Exporter for BasicExporter {
     }
 
     fn export(&self, notebook: &NotebookV4) -> Result<ExportResult, TransformError> {
+        let resources = if self.options.extract_resources {
+            extract_resources(notebook)
+        } else {
+            ResourceBundle::default()
+        };
+        let mut notebook = notebook.clone();
+        if !self.options.retain_outputs || !self.options.retain_execution_counts {
+            for cell in &mut notebook.cells {
+                if let Cell::Code {
+                    execution_count,
+                    outputs,
+                    ..
+                } = cell
+                {
+                    if !self.options.retain_outputs {
+                        outputs.clear();
+                    }
+                    if !self.options.retain_execution_counts {
+                        *execution_count = None;
+                    }
+                }
+            }
+        }
         let (body, mime_type) = match &self.format {
-            FormatId::Markdown => (notebook_to_markdown(notebook), "text/markdown"),
-            FormatId::Notebook => (notebook_to_json(notebook)?, "application/x-ipynb+json"),
-            FormatId::Html => (notebook_to_html(notebook), "text/html"),
+            FormatId::Markdown => (notebook_to_markdown(&notebook), "text/markdown"),
+            FormatId::Notebook => (notebook_to_json(&notebook)?, "application/x-ipynb+json"),
+            FormatId::Html => (notebook_to_html(&notebook), "text/html"),
+            FormatId::Rst => (notebook_to_rst(&notebook), "text/x-rst"),
+            FormatId::AsciiDoc => (notebook_to_asciidoc(&notebook), "text/asciidoc"),
+            FormatId::Quarto => (notebook_to_markdown(&notebook), "text/markdown"),
+            FormatId::Pandoc => (notebook_to_markdown(&notebook), "text/markdown"),
             FormatId::Script { language, kind } => (
                 notebook_to_script(
-                    notebook,
+                    &notebook,
                     match kind {
                         ScriptKind::Percent => "percent",
                         ScriptKind::Light => "light",
@@ -330,7 +495,7 @@ impl Exporter for BasicExporter {
             body,
             mime_type: mime_type.into(),
             output_extension: self.format.output_suffix(),
-            resources: ResourceBundle::default(),
+            resources,
         })
     }
 }
@@ -344,6 +509,306 @@ pub fn export_notebook(
     format: &str,
 ) -> Result<ExportResult, TransformError> {
     BasicExporter::new(FormatId::parse(format)?).export(notebook)
+}
+
+/// Export a notebook with explicit retention and resource policies.
+pub fn export_notebook_with_options(
+    notebook: &NotebookV4,
+    format: &str,
+    options: ExportOptions,
+) -> Result<ExportResult, TransformError> {
+    BasicExporter::with_options(FormatId::parse(format)?, options).export(notebook)
+}
+
+/// Convert a notebook document to a text document using a registered exporter.
+pub trait Converter {
+    /// Convert without accessing the filesystem or executing notebook code.
+    fn convert(
+        &self,
+        input: &NotebookDocument,
+        output_format: FormatId,
+    ) -> Result<TextDocument, TransformError>;
+}
+
+/// Default converter backed by [`BasicExporter`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BasicConverter;
+
+impl Converter for BasicConverter {
+    fn convert(
+        &self,
+        input: &NotebookDocument,
+        output_format: FormatId,
+    ) -> Result<TextDocument, TransformError> {
+        let result = BasicExporter::new(output_format.clone()).export(&input.notebook)?;
+        Ok(TextDocument {
+            body: result.body,
+            format: output_format,
+            resources: result.resources,
+        })
+    }
+}
+
+/// Run a notebook through an ordered preprocessor pipeline before exporting.
+pub fn export_notebook_with_pipeline(
+    notebook: &NotebookV4,
+    format: &str,
+    pipeline: &PreprocessorPipeline,
+) -> Result<ExportResult, TransformError> {
+    let mut processed = notebook.clone();
+    let mut resources = extract_resources(&processed);
+    pipeline.process(&mut processed, &mut resources)?;
+    let mut result = export_notebook(&processed, format)?;
+    result.resources = resources;
+    Ok(result)
+}
+
+/// A file writer for export bodies and extracted resources.
+#[derive(Debug, Clone, Copy)]
+pub struct FileWriter {
+    /// Replace existing output files when true.
+    pub overwrite: bool,
+    /// Write through sibling temporary files when true.
+    pub atomic: bool,
+}
+
+impl Default for FileWriter {
+    fn default() -> Self {
+        Self {
+            overwrite: true,
+            atomic: true,
+        }
+    }
+}
+
+impl FileWriter {
+    /// Create a writer with explicit overwrite and atomic-write behavior.
+    pub fn new(overwrite: bool, atomic: bool) -> Self {
+        Self { overwrite, atomic }
+    }
+}
+
+/// Contract for writing an in-memory export to a destination base path.
+pub trait Writer {
+    /// Write the primary body and resources, returning the primary output path.
+    fn write(&self, result: &ExportResult, output_base: &Path) -> Result<PathBuf, TransformError>;
+}
+
+impl Writer for FileWriter {
+    fn write(&self, result: &ExportResult, output_base: &Path) -> Result<PathBuf, TransformError> {
+        let output = output_base.with_extension(&result.output_extension);
+        if !self.overwrite && output.exists() {
+            return Err(TransformError::Configuration(format!(
+                "output already exists: {}",
+                output.display()
+            )));
+        }
+        if self.atomic {
+            atomic_write(&output, result.body.as_bytes())?;
+        } else {
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&output, &result.body)?;
+        }
+        if !result.resources.outputs.is_empty() {
+            let resource_root = output
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("resources");
+            fs::create_dir_all(&resource_root)?;
+            for (name, contents) in &result.resources.outputs {
+                let relative = safe_resource_path(name);
+                let path = resource_root.join(relative);
+                if self.atomic {
+                    atomic_write(&path, contents)?;
+                } else {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(path, contents)?;
+                }
+            }
+        }
+        Ok(output)
+    }
+}
+
+/// Write an export through the supplied writer.
+pub fn write_export<W: Writer>(
+    writer: &W,
+    result: &ExportResult,
+    output_base: impl AsRef<Path>,
+) -> Result<PathBuf, TransformError> {
+    writer.write(result, output_base.as_ref())
+}
+
+/// Ordered notebook transformation hook used by exporters and workflows.
+pub trait Preprocessor {
+    /// Stable name used in diagnostics and configuration.
+    fn name(&self) -> &str;
+    /// Mutate the notebook and its resources before export.
+    fn process(
+        &self,
+        notebook: &mut NotebookV4,
+        resources: &mut ResourceBundle,
+    ) -> Result<(), TransformError>;
+}
+
+/// An ordered collection of preprocessors.
+#[derive(Default)]
+pub struct PreprocessorPipeline {
+    preprocessors: Vec<Box<dyn Preprocessor>>,
+}
+
+impl PreprocessorPipeline {
+    /// Create an empty preprocessor pipeline.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a preprocessor and return the updated pipeline.
+    pub fn push<P: Preprocessor + 'static>(mut self, preprocessor: P) -> Self {
+        self.preprocessors.push(Box::new(preprocessor));
+        self
+    }
+
+    /// Run every preprocessor in registration order.
+    pub fn process(
+        &self,
+        notebook: &mut NotebookV4,
+        resources: &mut ResourceBundle,
+    ) -> Result<(), TransformError> {
+        for preprocessor in &self.preprocessors {
+            preprocessor.process(notebook, resources).map_err(|error| {
+                TransformError::Configuration(format!(
+                    "preprocessor {} failed: {error}",
+                    preprocessor.name()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Remove all outputs from code cells while retaining their source.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClearOutputs;
+
+impl Preprocessor for ClearOutputs {
+    fn name(&self) -> &str {
+        "clear_outputs"
+    }
+
+    fn process(
+        &self,
+        notebook: &mut NotebookV4,
+        resources: &mut ResourceBundle,
+    ) -> Result<(), TransformError> {
+        for cell in &mut notebook.cells {
+            if let Cell::Code { outputs, .. } = cell {
+                outputs.clear();
+            }
+        }
+        resources.outputs.clear();
+        resources.metadata.clear();
+        Ok(())
+    }
+}
+
+/// Reset code-cell execution counts without removing outputs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResetExecutionCounts;
+
+impl Preprocessor for ResetExecutionCounts {
+    fn name(&self) -> &str {
+        "reset_execution_counts"
+    }
+
+    fn process(
+        &self,
+        notebook: &mut NotebookV4,
+        _resources: &mut ResourceBundle,
+    ) -> Result<(), TransformError> {
+        for cell in &mut notebook.cells {
+            if let Cell::Code {
+                execution_count, ..
+            } = cell
+            {
+                *execution_count = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Merge adjacent stream outputs with the same stream name.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CoalesceStreams;
+
+impl Preprocessor for CoalesceStreams {
+    fn name(&self) -> &str {
+        "coalesce_streams"
+    }
+
+    fn process(
+        &self,
+        notebook: &mut NotebookV4,
+        _resources: &mut ResourceBundle,
+    ) -> Result<(), TransformError> {
+        for cell in &mut notebook.cells {
+            let Cell::Code { outputs, .. } = cell else {
+                continue;
+            };
+            let mut coalesced = Vec::with_capacity(outputs.len());
+            for output in outputs.drain(..) {
+                if let (
+                    Some(Output::Stream {
+                        name: existing_name,
+                        text: existing_text,
+                    }),
+                    Output::Stream { name, text },
+                ) = (coalesced.last_mut(), &output)
+                {
+                    if existing_name == name {
+                        existing_text.0.push_str(&text.0);
+                        continue;
+                    }
+                }
+                coalesced.push(output);
+            }
+            *outputs = coalesced;
+        }
+        Ok(())
+    }
+}
+
+/// Remove cells containing any configured tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveTaggedCells {
+    /// Tags that cause a cell to be removed.
+    pub tags: Vec<String>,
+}
+
+impl Preprocessor for RemoveTaggedCells {
+    fn name(&self) -> &str {
+        "remove_tagged_cells"
+    }
+
+    fn process(
+        &self,
+        notebook: &mut NotebookV4,
+        _resources: &mut ResourceBundle,
+    ) -> Result<(), TransformError> {
+        notebook.cells.retain(|cell| {
+            !cell.metadata().tags.as_ref().is_some_and(|cell_tags| {
+                cell_tags
+                    .iter()
+                    .any(|tag| self.tags.iter().any(|wanted| wanted == tag))
+            })
+        });
+        Ok(())
+    }
 }
 
 /// Options controlling parsing and conversion behavior.
@@ -819,6 +1284,81 @@ pub fn notebook_to_script(notebook: &NotebookV4, format: &str, language: &str) -
     output
 }
 
+/// Render a notebook as reStructuredText with native code blocks.
+pub fn notebook_to_rst(notebook: &NotebookV4) -> String {
+    let mut output = String::new();
+    for (index, cell) in notebook.cells.iter().enumerate() {
+        if index > 0 && !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        match cell {
+            Cell::Markdown { source, .. } | Cell::Raw { source, .. } => {
+                output.push_str(&source.concat());
+            }
+            Cell::Code {
+                metadata, source, ..
+            } => {
+                let language = metadata
+                    .additional
+                    .get("language")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("text");
+                output.push_str(".. code-block:: ");
+                output.push_str(language);
+                output.push_str("\n\n");
+                for line in source.concat().lines() {
+                    output.push_str("   ");
+                    output.push_str(line);
+                    output.push('\n');
+                }
+            }
+        }
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    if !output.is_empty() && !output.ends_with("\n\n") {
+        output.push('\n');
+    }
+    output
+}
+
+/// Render a notebook as AsciiDoc with source blocks.
+pub fn notebook_to_asciidoc(notebook: &NotebookV4) -> String {
+    let mut output = String::new();
+    for (index, cell) in notebook.cells.iter().enumerate() {
+        if index > 0 && !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        match cell {
+            Cell::Markdown { source, .. } | Cell::Raw { source, .. } => {
+                output.push_str(&source.concat());
+            }
+            Cell::Code {
+                metadata, source, ..
+            } => {
+                let language = metadata
+                    .additional
+                    .get("language")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("text");
+                output.push_str("[source,");
+                output.push_str(language);
+                output.push_str("]\n----\n");
+                output.push_str(&source.concat());
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str("----\n");
+            }
+        }
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output
+}
+
 /// Render notebook source into a deterministic, dependency-free HTML document.
 ///
 /// Cell source is escaped and placed in stable indexed sections. This is a
@@ -878,6 +1418,149 @@ pub fn notebook_to_json(notebook: &NotebookV4) -> Result<String, TransformError>
     ))?)
 }
 
+/// Parse source text into the canonical notebook model.
+///
+/// `format` must identify a supported input format. Markdown, Quarto, and
+/// Pandoc-oriented Markdown currently share the Markdown parser; RST and
+/// AsciiDoc are output-only until native parsers are added.
+pub fn source_to_notebook(
+    source: &str,
+    format: &str,
+    options: &TransformOptions,
+) -> Result<NotebookV4, TransformError> {
+    match FormatId::parse(format)? {
+        FormatId::Notebook => notebook_from_json(source),
+        FormatId::Script { language, kind } => script_to_notebook(
+            source,
+            match kind {
+                ScriptKind::Percent => "percent",
+                ScriptKind::Light => "light",
+            },
+            &language,
+        ),
+        FormatId::Markdown | FormatId::Quarto | FormatId::Pandoc => {
+            markdown_to_notebook(source, options)
+        }
+        FormatId::Html | FormatId::Rst | FormatId::AsciiDoc => Err(TransformError::Configuration(
+            "the selected format is output-only".into(),
+        )),
+    }
+}
+
+/// Extract binary notebook attachments and rich display data into stable keys.
+pub fn extract_resources(notebook: &NotebookV4) -> ResourceBundle {
+    let mut resources = ResourceBundle::default();
+    for (cell_index, cell) in notebook.cells.iter().enumerate() {
+        let Ok(value) = serde_json::to_value(cell) else {
+            continue;
+        };
+        if let Some(attachments) = value
+            .get("attachments")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (name, data) in attachments {
+                collect_mime_resources(
+                    &mut resources,
+                    data,
+                    format!(
+                        "cell-{cell_index}/attachment-{}",
+                        safe_resource_path(name).display()
+                    ),
+                );
+            }
+        }
+        if let Some(outputs) = value.get("outputs").and_then(serde_json::Value::as_array) {
+            for (output_index, output) in outputs.iter().enumerate() {
+                if let Some(data) = output.get("data") {
+                    collect_mime_resources(
+                        &mut resources,
+                        data,
+                        format!("cell-{cell_index}/output-{output_index}"),
+                    );
+                }
+            }
+        }
+    }
+    resources
+}
+
+fn collect_mime_resources(
+    resources: &mut ResourceBundle,
+    value: &serde_json::Value,
+    prefix: String,
+) {
+    let Some(data) = value.as_object() else {
+        return;
+    };
+    for (mime, payload) in data {
+        let Some(payload) = payload.as_str() else {
+            continue;
+        };
+        let Some(extension) = resource_extension(mime) else {
+            continue;
+        };
+        let contents = if mime.starts_with("image/") || mime == "application/pdf" {
+            decode_base64(payload).unwrap_or_else(|| payload.as_bytes().to_vec())
+        } else {
+            payload.as_bytes().to_vec()
+        };
+        let name = format!("{prefix}.{extension}");
+        resources.outputs.insert(name.clone(), contents);
+        resources
+            .metadata
+            .insert(name, serde_json::Value::String(mime.clone()));
+    }
+}
+
+fn resource_extension(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/svg+xml" => Some("svg"),
+        "application/pdf" => Some("pdf"),
+        "text/html" => Some("html"),
+        "application/javascript" | "text/javascript" => Some("js"),
+        _ => None,
+    }
+}
+
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for byte in value.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        if byte == b'=' {
+            break;
+        }
+        let digit = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32;
+        buffer = (buffer << 6) | digit;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(output)
+}
+
+fn safe_resource_path(name: &str) -> PathBuf {
+    Path::new(name)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Convert one source file to the requested output files.
 ///
 /// The input format is inferred from the extension and script markers. Use
@@ -908,23 +1591,7 @@ pub fn transform_file_with_input_format(
         .map(FormatId::parse)
         .transpose()?
         .unwrap_or_else(|| detect_input_format(source, &source_text));
-    let notebook = match input_format {
-        FormatId::Notebook => notebook_from_json(&source_text)?,
-        FormatId::Script { language, kind } => script_to_notebook(
-            &source_text,
-            match kind {
-                ScriptKind::Percent => "percent",
-                ScriptKind::Light => "light",
-            },
-            &language,
-        )?,
-        FormatId::Html => {
-            return Err(TransformError::Configuration(
-                "html is an output-only format".into(),
-            ));
-        }
-        FormatId::Markdown => markdown_to_notebook(&source_text, options)?,
-    };
+    let notebook = source_to_notebook(&source_text, &input_format.canonical_name(), options)?;
     let output_base = output_base.as_ref();
     if let Some(parent) = output_base.parent() {
         fs::create_dir_all(parent)?;
@@ -934,10 +1601,10 @@ pub fn transform_file_with_input_format(
         .map(|format| FormatId::parse(format))
         .collect::<Result<Vec<_>, _>>()?;
     let mut outputs = Vec::new();
+    let writer = FileWriter::default();
     for (format, parsed_format) in formats.iter().zip(parsed_formats) {
         let exported = BasicExporter::new(parsed_format).export(&notebook)?;
-        let path = output_base.with_extension(&exported.output_extension);
-        fs::write(&path, exported.body)?;
+        let path = write_export(&writer, &exported, output_base)?;
         outputs.push(TransformOutput {
             path,
             format: format.clone(),
@@ -954,6 +1621,19 @@ pub fn detect_input_format(path: &Path, source: &str) -> FormatId {
     let extension = path.extension().and_then(|value| value.to_str());
     if extension.is_some_and(|value| value.eq_ignore_ascii_case("ipynb")) {
         return FormatId::Notebook;
+    }
+    if extension.is_some_and(|value| value.eq_ignore_ascii_case("qmd")) {
+        return FormatId::Quarto;
+    }
+    if extension.is_some_and(|value| {
+        value.eq_ignore_ascii_case("rst") || value.eq_ignore_ascii_case("rest")
+    }) {
+        return FormatId::Rst;
+    }
+    if extension.is_some_and(|value| {
+        value.eq_ignore_ascii_case("adoc") || value.eq_ignore_ascii_case("asciidoc")
+    }) {
+        return FormatId::AsciiDoc;
     }
     if let Some(spec) = extension.and_then(language_spec) {
         let kind = if source
@@ -1023,9 +1703,17 @@ pub fn sync_pair(
     let notebook_path = notebook_path.as_ref().to_owned();
     let text_path = text_path.as_ref().to_owned();
     let text_format_id = FormatId::parse(text_format)?;
-    if matches!(text_format_id, FormatId::Notebook | FormatId::Html) {
+    if matches!(
+        text_format_id,
+        FormatId::Notebook
+            | FormatId::Html
+            | FormatId::Rst
+            | FormatId::AsciiDoc
+            | FormatId::Quarto
+            | FormatId::Pandoc
+    ) {
         return Err(TransformError::Configuration(
-            "sync text format must not be ipynb".into(),
+            "sync text format must be a round-trip Markdown or script format".into(),
         ));
     }
 
@@ -1060,7 +1748,12 @@ pub fn sync_pair(
                     },
                     language,
                 )?,
-                FormatId::Notebook | FormatId::Html => unreachable!(),
+                FormatId::Notebook
+                | FormatId::Html
+                | FormatId::Rst
+                | FormatId::AsciiDoc
+                | FormatId::Quarto
+                | FormatId::Pandoc => unreachable!(),
             };
             atomic_write(&notebook_path, notebook_to_json(&notebook)?.as_bytes())?;
             return Ok(SyncResult {
@@ -1084,7 +1777,12 @@ pub fn sync_pair(
             },
             language,
         )?,
-        FormatId::Notebook | FormatId::Html => unreachable!(),
+        FormatId::Notebook
+        | FormatId::Html
+        | FormatId::Rst
+        | FormatId::AsciiDoc
+        | FormatId::Quarto
+        | FormatId::Pandoc => unreachable!(),
     };
     let canonical_text = BasicExporter::new(text_format_id.clone())
         .export(&notebook)?
@@ -1807,6 +2505,137 @@ mod tests {
         assert_eq!(html.mime_type, "text/html");
         assert_eq!(html.output_extension, "html");
         assert!(html.body.contains("&lt;safe&gt;"));
+    }
+
+    #[test]
+    fn export_foundation_supports_formats_resources_and_writers() {
+        let notebook = markdown_to_notebook(
+            "# Title\n\n```python\nprint(1)\n```\n",
+            &TransformOptions::default(),
+        )
+        .unwrap();
+        let rst = export_notebook(&notebook, "rst").unwrap();
+        assert_eq!(rst.mime_type, "text/x-rst");
+        assert!(rst.body.contains(".. code-block:: python"));
+        let adoc = export_notebook(&notebook, "adoc").unwrap();
+        assert_eq!(adoc.output_extension, "adoc");
+        assert!(adoc.body.contains("[source,python]"));
+
+        let document = NotebookDocument::new(notebook.clone());
+        let converted = BasicConverter.convert(&document, FormatId::Quarto).unwrap();
+        assert_eq!(converted.format, FormatId::Quarto);
+        assert!(converted.body.contains("# Title"));
+
+        let output = tempfile::tempdir().unwrap();
+        let path = write_export(
+            &FileWriter::default(),
+            &rst,
+            output.path().join("nested/note"),
+        )
+        .unwrap();
+        assert_eq!(path, output.path().join("nested/note.rst"));
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn resource_extraction_and_preprocessors_are_deterministic() {
+        let json = r##"{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"code","id":"cell-0","metadata":{"tags":["remove"]},"execution_count":3,"source":["print(1)\n"],"outputs":[{"output_type":"display_data","data":{"image/png":"SGVsbG8="},"metadata":{}}]}]}"##;
+        let notebook = match nbformat::parse_notebook(json).unwrap() {
+            Notebook::V4(notebook) => notebook,
+            _ => panic!("expected v4 notebook"),
+        };
+        let resources = extract_resources(&notebook);
+        assert_eq!(
+            resources.outputs.get("cell-0/output-0.png"),
+            Some(&b"Hello".to_vec())
+        );
+        assert_eq!(
+            resources.metadata.get("cell-0/output-0.png"),
+            Some(&serde_json::Value::String("image/png".into()))
+        );
+        let pipeline = PreprocessorPipeline::new()
+            .push(ClearOutputs)
+            .push(ResetExecutionCounts)
+            .push(RemoveTaggedCells {
+                tags: vec!["remove".into()],
+            });
+        let result = export_notebook_with_pipeline(&notebook, "ipynb", &pipeline).unwrap();
+        assert!(!result.body.contains("execution_count"));
+        assert!(!result.body.contains("print(1)"));
+
+        let stream_json = r##"{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"code","id":"cell-0","metadata":{},"execution_count":null,"source":["print(1)\n"],"outputs":[{"output_type":"stream","name":"stdout","text":["one\n"]},{"output_type":"stream","name":"stdout","text":["two\n"]}]}]}"##;
+        let mut stream_notebook = match nbformat::parse_notebook(stream_json).unwrap() {
+            Notebook::V4(notebook) => notebook,
+            _ => panic!("expected v4 notebook"),
+        };
+        let mut stream_resources = ResourceBundle::default();
+        PreprocessorPipeline::new()
+            .push(CoalesceStreams)
+            .process(&mut stream_notebook, &mut stream_resources)
+            .unwrap();
+        let stream_output = notebook_to_json(&stream_notebook).unwrap();
+        let parsed_stream = match nbformat::parse_notebook(&stream_output).unwrap() {
+            Notebook::V4(notebook) => notebook,
+            _ => panic!("expected v4 notebook"),
+        };
+        match &parsed_stream.cells[0] {
+            Cell::Code { outputs, .. } => {
+                assert_eq!(outputs.len(), 1);
+                match &outputs[0] {
+                    Output::Stream { text, .. } => assert_eq!(text.0, "one\ntwo\n"),
+                    _ => panic!("expected stream output"),
+                }
+            }
+            _ => panic!("expected code cell"),
+        }
+
+        let file_result = ExportResult {
+            body: "body\n".into(),
+            mime_type: "text/plain".into(),
+            output_extension: "txt".into(),
+            resources: ResourceBundle {
+                outputs: BTreeMap::from([("../asset.bin".into(), b"asset".to_vec())]),
+                metadata: BTreeMap::new(),
+            },
+        };
+        let output = tempfile::tempdir().unwrap();
+        let path = write_export(
+            &FileWriter::default(),
+            &file_result,
+            output.path().join("written"),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "body\n");
+        assert_eq!(
+            fs::read(output.path().join("resources/asset.bin")).unwrap(),
+            b"asset"
+        );
+    }
+
+    #[test]
+    fn export_policies_and_error_codes_are_explicit() {
+        let error = FormatId::parse("unknown").unwrap_err();
+        assert_eq!(error.code(), ErrorCode::UnsupportedFormat);
+        let json = r##"{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"code","id":"cell-0","metadata":{},"execution_count":3,"source":["value = 1\n"],"outputs":[] }]}"##;
+        let notebook = match nbformat::parse_notebook(json).unwrap() {
+            Notebook::V4(notebook) => notebook,
+            _ => panic!("expected v4 notebook"),
+        };
+        let result = export_notebook_with_options(
+            &notebook,
+            "ipynb",
+            ExportOptions {
+                extract_resources: false,
+                retain_outputs: true,
+                retain_execution_counts: false,
+            },
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&result.body).unwrap();
+        assert_eq!(
+            value["cells"][0]["execution_count"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

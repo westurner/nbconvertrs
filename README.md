@@ -47,6 +47,15 @@ possible. JSON output is deterministic for equivalent notebook structures.
   rendering are intentionally deferred to the resource/exporter milestones in
   `docs/PARITY_PLAN.md`.
 
+### Static text exporters
+
+- `rst` and `rest` render code cells as reStructuredText `code-block`
+  directives.
+- `asciidoc` and `adoc` render code cells as AsciiDoc source blocks.
+- `quarto`/`qmd` and `pandoc` provide Markdown-oriented one-way output names;
+  their format-specific execution directives are not interpreted.
+- These formats are output-only and cannot be used as synchronization sources.
+
 ## Library API
 
 ```rust
@@ -65,6 +74,13 @@ The main entry points are:
   typed format discovery.
 - `Exporter`, `BasicExporter`, `ExportResult`, `ResourceBundle`, and
   `export_notebook(notebook, format)` for in-memory conversion.
+- `NotebookDocument`, `TextDocument`, `Converter`, and `BasicConverter` for
+  filesystem-free conversion composition.
+- `Preprocessor`, `PreprocessorPipeline`, `ClearOutputs`,
+  `ResetExecutionCounts`, and `RemoveTaggedCells` for ordered notebook
+  preprocessing.
+- `FileWriter`, `Writer`, and `write_export` for atomic file output and
+  extracted resources.
 - `markdown_to_notebook(source, options)`
 - `script_to_notebook(source, format, language)`
 - `notebook_to_markdown(notebook)`
@@ -73,6 +89,8 @@ The main entry points are:
 - `transform_file(source, output_base, formats, options)`
 - `transform_file_with_input_format(source, output_base, formats, options,
   input_format)`
+- `source_to_notebook(source, format, options)` and
+  `export_notebook_with_options(notebook, format, options)`
 - `sync_pair(notebook, text, format, options)` for conflict-aware pair
   synchronization with atomic writes.
 - `transform_manifest(manifest, dry_run)`
@@ -97,6 +115,8 @@ Single-file conversion:
 nbconvertrs document.md --output build/document --out-format=myst,ipynb
 nbconvertrs document.md --output build/document --to py:percent
 nbconvertrs source.txt --from py:percent --output build/document --to ipynb
+nbconvertrs document.md --to rst --stdout
+cat document.md | nbconvertrs - --from myst --to html --stdout
 ```
 
 Directory conversion:
@@ -150,12 +170,13 @@ incremental workflow behavior.
 
 This crate implements the supported transform subset in Rust. It does not
 execute notebooks or kernels, render LaTeX/PDF/slides, or provide Jinja
-templates and nbconvert preprocessors yet. Its static HTML exporter does not
-yet render rich MIME outputs or extract resources. It also does not attempt to
-reproduce every Jupytext format or language-specific option. Unsupported
-output formats return `TransformError::UnsupportedFormat` so callers can
-choose a Python/Jupytext or nbconvert fallback when their workflow requires a
-broader format matrix. The staged implementation roadmap is in
+templates and the complete nbconvert preprocessor catalog. Its static HTML exporter does not
+yet render rich MIME outputs, although supported binary MIME data is available
+through `ResourceBundle`. It also does not attempt to reproduce every Jupytext
+format or language-specific option. Unsupported output formats return
+`TransformError::UnsupportedFormat` so callers can choose a Python/Jupytext or
+nbconvert fallback when their workflow requires a broader format matrix. The
+staged implementation roadmap is in
 [`docs/PARITY_PLAN.md`](docs/PARITY_PLAN.md).
 
 ## Citation

@@ -1,10 +1,12 @@
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use nbconvertrs::{
-    SyncDirection, TransformOptions, load_workflow_config, sync_pair,
-    transform_file_with_input_format, transform_manifest, transform_manifest_with_config,
+    SyncDirection, TransformOptions, detect_input_format, export_notebook, load_workflow_config,
+    source_to_notebook, sync_pair, transform_file_with_input_format, transform_manifest,
+    transform_manifest_with_config,
 };
 
 #[derive(Debug, Parser)]
@@ -20,8 +22,11 @@ struct Args {
     indir: Option<PathBuf>,
     #[arg(long, conflicts_with = "indir")]
     output: Option<PathBuf>,
-    #[arg(long, conflicts_with = "source")]
+    #[arg(long, visible_alias = "output-dir", conflicts_with = "source")]
     outdir: Option<PathBuf>,
+    /// Write one rendered body to stdout instead of creating files.
+    #[arg(long, conflicts_with_all = ["output", "outdir", "indir"])]
+    stdout: bool,
     #[arg(long, value_delimiter = ',', conflicts_with = "to")]
     out_format: Option<Vec<String>>,
     /// One output format, using aliases such as `myst`, `ipynb`, or `py:percent`.
@@ -33,6 +38,9 @@ struct Args {
     /// Synchronize a notebook source with the text path supplied by --output.
     #[arg(long)]
     sync: bool,
+    /// Execute notebook cells before conversion (not yet available).
+    #[arg(long)]
+    execute: bool,
     #[arg(long)]
     transform_cell_split: Option<String>,
     /// Workflow `_toc.yml` used to locate the default manifest and transform settings.
@@ -48,6 +56,12 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.execute {
+        return Err(
+            "--execute is not available yet; use a Jupyter kernel adapter or static conversion"
+                .into(),
+        );
+    }
     if args.sync {
         if args.manifest.is_some() || args.config.is_some() || args.indir.is_some() {
             return Err("--sync cannot be combined with workflow mode".into());
@@ -73,6 +87,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             result.notebook.display(),
             result.text.display()
         );
+        return Ok(());
+    }
+    if args.stdout {
+        if args.manifest.is_some() || args.config.is_some() {
+            return Err("--stdout cannot be combined with workflow mode".into());
+        }
+        let source = args.source.ok_or("--stdout requires a source file or -")?;
+        let format = match (&args.to, &args.out_format) {
+            (Some(format), None) => format.clone(),
+            (None, Some(formats)) if formats.len() == 1 => formats[0].clone(),
+            (None, None) => return Err("--stdout requires --to FORMAT".into()),
+            _ => return Err("--stdout requires exactly one output format".into()),
+        };
+        let mut source_text = String::new();
+        if source == Path::new("-") {
+            io::stdin().read_to_string(&mut source_text)?;
+        } else {
+            source_text = fs::read_to_string(&source)?;
+        }
+        let input_format = args
+            .from
+            .clone()
+            .unwrap_or_else(|| detect_input_format(&source, &source_text).canonical_name());
+        let notebook = source_to_notebook(
+            &source_text,
+            &input_format,
+            &TransformOptions {
+                cell_split: args.transform_cell_split.clone(),
+            },
+        )?;
+        let result = export_notebook(&notebook, &format)?;
+        print!("{}", result.body);
         return Ok(());
     }
     if args.manifest.is_some()

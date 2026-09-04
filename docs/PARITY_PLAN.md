@@ -27,6 +27,18 @@ Every feature in this plan must identify its parity level and record accepted
 differences. Unsupported behavior should produce a specific diagnostic and a
 clear fallback path rather than silently losing notebook content.
 
+## Implementation status
+
+The current implementation has completed the conversion core, common script
+format registry, pair synchronization, and the first export-foundation slice.
+The foundation now includes typed notebook/text documents, stable error
+categories, deterministic resource extraction for common binary MIME values,
+an atomic file writer, an ordered preprocessor pipeline, and native one-way
+RST and AsciiDoc exporters. Quarto and Pandoc-oriented Markdown output names
+are also registered as explicit one-way formats. These additions provide
+semantic parity for the documented subset; they do not claim full Jupytext or
+nbconvert parity.
+
 ## Current baseline
 
 `nbconvertrs` currently provides:
@@ -49,9 +61,10 @@ The current public API is centered on `markdown_to_notebook`,
 `notebook_to_json`, `transform_file`, and manifest helpers. The CLI currently
 accepts one source file, a Markdown directory, or a workflow manifest/config.
 
-The current implementation does **not** yet provide general Jupytext pairing
-and synchronization, the complete Jupytext format matrix, nbconvert exporters,
-Jinja templates, preprocessors, resource writers, or notebook execution.
+The current implementation does **not** yet provide the complete Jupytext
+format matrix, Jinja templates, the complete nbconvert preprocessor catalog,
+multi-pair configuration, or notebook execution. External Pandoc, LaTeX,
+PDF, Reveal.js, and kernel adapters remain optional future work.
 
 ## Compatibility contract
 
