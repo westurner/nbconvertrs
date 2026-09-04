@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nbformat::Notebook;
 use nbformat::v4::{Cell, CellId, CellMetadata, Notebook as NotebookV4, Output};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -73,6 +74,23 @@ impl TransformError {
 
 /// A normalized format requested by a caller or detected from a path.
 ///
+/// The built-in non-script formats use these canonical names and aliases:
+///
+/// | Canonical | Aliases | Input | Output |
+/// | --- | --- | --- | --- |
+/// | `myst` | `md`, `markdown` | yes | yes |
+/// | `ipynb` | `notebook` | yes | yes |
+/// | `html` | none | no | yes |
+/// | `rst` | `rest` | no | yes |
+/// | `asciidoc` | `adoc` | no | yes |
+/// | `quarto` | `qmd` | no | yes |
+/// | `pandoc` | none | no | yes |
+///
+/// Script formats use the spelling `<language>:<kind>`, where `<kind>` is
+/// `percent` or `light`. The language may be its canonical name or a
+/// registered file extension, such as `python:percent` or `py:percent`.
+/// See [`language_specs`] for the complete language registry.
+///
 /// Use [`FormatId::parse`] at API boundaries. The parser accepts canonical
 /// names and aliases such as `markdown`, `notebook`, and `py:percent`, then
 /// stores a single canonical representation for dispatch.
@@ -102,9 +120,17 @@ pub enum FormatId {
 }
 
 /// Input-format spelling retained as an explicit API concept.
+///
+/// This is an alias for [`FormatId`]. The input-capable built-ins are `myst`,
+/// `ipynb`, and registered script formats. Output-only formats return a
+/// configuration error when used as a source format.
 pub type InputFormat = FormatId;
 
 /// Output-format spelling retained as an explicit API concept.
+///
+/// This is an alias for [`FormatId`]. Every non-script format in the registry
+/// is available as an output, and registered script formats can also be
+/// selected with the `<language>:<kind>` spelling.
 pub type OutputFormat = FormatId;
 
 /// The cell-marker convention used by a script format.
@@ -117,6 +143,10 @@ pub enum ScriptKind {
 }
 
 /// Static information used to parse and render a script language.
+///
+/// The canonical `name` and every entry in `extensions` are accepted in the
+/// language position of a script format. For example, the Python descriptor
+/// allows both `python:percent` and `py:percent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LanguageSpec {
     /// Canonical language name used in [`FormatId::Script`].
@@ -190,6 +220,11 @@ pub fn language_specs() -> &'static [LanguageSpec] {
 }
 
 /// A format descriptor suitable for discovery and UI/configuration code.
+///
+/// The descriptor list returned by [`format_descriptors`] covers the
+/// non-language-specific formats. Script formats are generated from
+/// [`language_specs`] and [`ScriptKind`]. A descriptor with `round_trip` set
+/// to `false` is an output-only representation in the current implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatDescriptor {
     /// Canonical format name accepted by [`FormatId::parse`].
@@ -249,6 +284,11 @@ const FORMAT_DESCRIPTORS: &[FormatDescriptor] = &[
 ];
 
 /// Return descriptors for the built-in non-language-specific formats.
+///
+/// The returned static slice is suitable for format pickers and configuration
+/// validation. Its entries are ordered as `myst`, `ipynb`, `html`, `rst`,
+/// `asciidoc`, `quarto`, and `pandoc`; aliases and extensions are included in
+/// each descriptor rather than repeated by callers.
 ///
 /// Script formats are described separately by [`language_specs`], because a
 /// script format combines a language and a [`ScriptKind`].
@@ -803,6 +843,52 @@ impl Preprocessor for RemoveTaggedCells {
                     .any(|tag| self.tags.iter().any(|wanted| wanted == tag))
             })
         });
+        Ok(())
+    }
+}
+
+/// Remove cells whose source matches a regular expression.
+///
+/// The pattern is compiled when [`Preprocessor::process`] runs, so an invalid
+/// pattern produces a [`TransformError::Configuration`] result instead of a
+/// panic. Matching is performed against the complete concatenated source of
+/// each cell, and resources are left unchanged.
+///
+/// ```
+/// use nbconvertrs::{Preprocessor, RegexRemove, ResourceBundle, TransformOptions,
+///     markdown_to_notebook};
+///
+/// let mut notebook = markdown_to_notebook(
+///     "keep\n\n```python\n# scratch\nprint(1)\n```\n",
+///     &TransformOptions::default(),
+/// ).unwrap();
+/// RegexRemove { pattern: r"(?m)^# scratch$".into() }
+///     .process(&mut notebook, &mut ResourceBundle::default())
+///     .unwrap();
+/// assert_eq!(notebook.cells.len(), 1);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegexRemove {
+    /// Regular expression matched against the complete cell source.
+    pub pattern: String,
+}
+
+impl Preprocessor for RegexRemove {
+    fn name(&self) -> &str {
+        "regex_remove"
+    }
+
+    fn process(
+        &self,
+        notebook: &mut NotebookV4,
+        _resources: &mut ResourceBundle,
+    ) -> Result<(), TransformError> {
+        let pattern = Regex::new(&self.pattern).map_err(|error| {
+            TransformError::Configuration(format!("invalid regex for {}: {error}", self.name()))
+        })?;
+        notebook
+            .cells
+            .retain(|cell| !pattern.is_match(&cell.source().concat()));
         Ok(())
     }
 }
@@ -3529,6 +3615,46 @@ mod tests {
             Cell::Code { outputs, .. } => assert_eq!(outputs.len(), 2),
             _ => panic!("expected code cell"),
         }
+    }
+
+    #[test]
+    fn regex_remove_filters_matching_cell_sources() {
+        let mut notebook = markdown_to_notebook(
+            "keep\n\n```python\n# scratch\nprint(1)\n```\n\n```python\nprint(2)\n```\n",
+            &TransformOptions::default(),
+        )
+        .unwrap();
+        let mut resources = ResourceBundle::default();
+
+        RegexRemove {
+            pattern: r"(?m)^# scratch$".into(),
+        }
+        .process(&mut notebook, &mut resources)
+        .unwrap();
+
+        assert_eq!(notebook.cells.len(), 2);
+        assert!(notebook.cells[0].source().concat().contains("keep"));
+        assert!(notebook.cells[1].source().concat().contains("print(2)"));
+        assert_eq!(
+            RegexRemove {
+                pattern: "x".into()
+            }
+            .name(),
+            "regex_remove"
+        );
+    }
+
+    #[test]
+    fn regex_remove_rejects_invalid_patterns() {
+        let mut notebook = markdown_to_notebook("text\n", &TransformOptions::default()).unwrap();
+        let error = RegexRemove {
+            pattern: "[".into(),
+        }
+        .process(&mut notebook, &mut ResourceBundle::default())
+        .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::Configuration);
+        assert!(error.to_string().contains("invalid regex for regex_remove"));
     }
 
     #[test]

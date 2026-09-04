@@ -13,23 +13,33 @@ use nbconvertrs::{
 #[command(
     name = "nbconvertrs",
     version,
-    about = "Transform Markdown and notebooks"
+    about = "Transform Markdown, scripts, and Jupyter notebooks",
+    after_help = "EXAMPLES:\n  nbconvertrs README.md --to ipynb --output build/README\n  nbconvertrs notebook.ipynb --to html --stdout\n  cat notebook.py | nbconvertrs - --from py:percent --to ipynb --stdout\n  nbconvertrs --indir docs --outdir build/docs --out-format myst,ipynb\n  nbconvertrs note.ipynb --sync --output note.md --to myst\n  nbconvertrs --manifest .tmp/workflow/chat-manifest.json --dry-run\n\nFORMAT NAMES:\n  See README.md, 'Input and output formats', for all names, aliases, and extensions.\n  Input override:  --from py:percent\n  One output:     --to html\n  Multiple outputs: --out-format myst,ipynb"
 )]
 struct Args {
-    /// One Markdown source file. Use --indir for a directory workflow.
+    /// Input file. Use `-` for stdin with --stdout, or use --indir for a directory workflow.
     source: Option<PathBuf>,
+    /// Recursively convert Markdown and MyST files beneath this directory.
     #[arg(long, conflicts_with = "source")]
     indir: Option<PathBuf>,
+    /// Output base path for a single source; the format extension is appended.
     #[arg(long, conflicts_with = "indir")]
     output: Option<PathBuf>,
+    /// Destination directory for --indir (defaults to INDIR/converted).
     #[arg(long, visible_alias = "output-dir", conflicts_with = "source")]
     outdir: Option<PathBuf>,
     /// Write one rendered body to stdout instead of creating files.
     #[arg(long, conflicts_with_all = ["output", "outdir", "indir"])]
     stdout: bool,
-    #[arg(long, value_delimiter = ',', conflicts_with = "to")]
+    /// Comma-separated output formats; defaults to myst,ipynb.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        conflicts_with = "to",
+        value_name = "FORMAT[,FORMAT...]"
+    )]
     out_format: Option<Vec<String>>,
-    /// One output format, using aliases such as `myst`, `ipynb`, or `py:percent`.
+    /// One output format, such as `myst`, `ipynb`, `html`, or `py:percent`.
     #[arg(long, conflicts_with = "out_format")]
     to: Option<String>,
     /// Override input format detection, for example `py:percent`.
@@ -38,9 +48,10 @@ struct Args {
     /// Synchronize a notebook source with the text path supplied by --output.
     #[arg(long)]
     sync: bool,
-    /// Execute notebook cells before conversion (not yet available).
+    /// Execute notebook cells before conversion (not available yet).
     #[arg(long)]
     execute: bool,
+    /// Markdown cell-splitting policy, currently `m1`.
     #[arg(long)]
     transform_cell_split: Option<String>,
     /// Workflow `_toc.yml` used to locate the default manifest and transform settings.

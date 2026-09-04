@@ -33,11 +33,12 @@ The current implementation has completed the conversion core, common script
 format registry, pair synchronization, and the first export-foundation slice.
 The foundation now includes typed notebook/text documents, stable error
 categories, deterministic resource extraction for common binary MIME values,
-an atomic file writer, an ordered preprocessor pipeline, and native one-way
-RST and AsciiDoc exporters. Quarto and Pandoc-oriented Markdown output names
-are also registered as explicit one-way formats. These additions provide
-semantic parity for the documented subset; they do not claim full Jupytext or
-nbconvert parity.
+an atomic file writer, an ordered preprocessor pipeline with output clearing,
+execution-count reset, stream coalescing, tag removal, and regex-based cell
+removal, and native one-way RST and AsciiDoc exporters. Quarto and
+Pandoc-oriented Markdown output names are also registered as explicit one-way
+formats. These additions provide semantic parity for the documented subset;
+they do not claim full Jupytext or nbconvert parity.
 
 ## Current baseline
 
