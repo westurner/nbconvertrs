@@ -118,8 +118,6 @@ pub enum FormatId {
         kind: ScriptKind,
     },
 }
-
-/// Input-format spelling retained as an explicit API concept.
 ///
 /// This is an alias for [`FormatId`]. The input-capable built-ins are `myst`,
 /// `ipynb`, and registered script formats. Output-only formats return a
@@ -2764,6 +2762,24 @@ mod tests {
         let parsed = nbformat::parse_notebook(&json).unwrap();
         assert!(matches!(parsed, Notebook::V4(_)));
         assert!(json.ends_with('\n'));
+    }
+
+    #[test]
+    fn preserves_high_precision_json_metadata_numbers() {
+        let source = r#"{
+  "cells": [],
+  "metadata": {
+    "value": 3.333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333e+103
+  },
+  "nbformat": 4,
+  "nbformat_minor": 5
+}"#;
+        let notebook = source_to_notebook(source, "ipynb", &TransformOptions::default()).unwrap();
+        let first = notebook_to_json(&notebook).unwrap();
+        let reparsed = source_to_notebook(&first, "ipynb", &TransformOptions::default()).unwrap();
+        let second = notebook_to_json(&reparsed).unwrap();
+
+        assert_eq!(first, second);
     }
 
     #[test]
