@@ -173,6 +173,49 @@ Tasks:
 **Exit criteria:** a new format or exporter cannot be marked complete without a
 fixture, a reference result, a Rust result, and a documented difference report.
 
+### Cargo-fuzz scope
+
+The conformance infrastructure includes a separate `cargo-fuzz` package under
+`fuzz/`. It is excluded from the production workspace and depends on the
+published library boundary rather than private parser helpers. Fuzz targets
+must be deterministic, must not execute notebook code, and must not require
+Pandoc, a kernel, or a network connection.
+
+The first target set is:
+
+- `markdown_to_notebook`: arbitrary UTF-8-lossy input through Markdown/MyST
+  parsing, followed by notebook serialization and a second parse when the
+  first parse succeeds.
+- `script_to_notebook`: arbitrary input across percent and light Python
+  scripts, including marker-like source text, metadata, and mixed newlines.
+- `notebook_json`: arbitrary bytes at the notebook JSON boundary, with
+  serialization and structural round-trip checks for valid notebooks.
+- `export_dispatch`: arbitrary input and format selection through
+  `source_to_notebook`, `export_notebook_with_options`, and
+  `extract_resources` for every built-in format family.
+
+The seed corpus is organized by behavior rather than by target: valid minimal
+documents, nested and unterminated fences, marker-like code, YAML metadata,
+legacy/invalid notebook JSON, Unicode and mixed newline input, attachments,
+rich MIME outputs, and oversized-but-bounded text. Corpus entries and crash
+artifacts are retained in the nested repository; generated coverage output and
+build directories are ignored.
+
+Fuzz targets treat expected parse and unsupported-format errors as normal
+results. They fail only on panics, resource exhaustion, or violated semantic
+invariants such as invalid notebook JSON after a successful notebook export.
+The harness records the target, input format, and normalized diagnostic code
+for reproducibility. Local smoke runs use a short `-max_total_time` budget;
+scheduled CI runs use a longer budget on the pinned Rust toolchain and publish
+minimized crashers. AddressSanitizer and UndefinedBehaviorSanitizer runs are
+optional hardening jobs because the core is safe Rust, but they remain useful
+for native dependencies and future parser integrations.
+
+**Cargo-fuzz exit criteria:** every target builds with `cargo fuzz build`, a
+short smoke run completes for each target, checked-in seed inputs exercise each
+target, and any discovered panic has a regression test or a documented
+accepted deviation before the related parity feature is marked complete.
+
 ### Phase 1: Stabilize the conversion core
 
 **Goal:** turn the current functions into a composable conversion pipeline.
@@ -388,7 +431,9 @@ unsupported behavior, and upgrade without depending on internal modules.
   format policies.
 - Property tests for supported parse/render round trips.
 - Fuzz tests for notebook JSON, YAML metadata, HTML markers, script markers,
-  templates, and resource names.
+  templates, and resource names. The cargo-fuzz scope and target contracts are
+  defined in Phase 0; pure-Rust property tests remain appropriate for small,
+  fast invariants that should run on every commit.
 
 ### Reference and golden tests
 
@@ -458,7 +503,7 @@ external-tool versions.
 
 | Milestone | Scope | Completion signal |
 | --- | --- | --- |
-| M0 | Conformance harness | Reference comparison and compatibility ledger run in CI |
+| M0 | Conformance harness | Reference comparison, compatibility ledger, and cargo-fuzz smoke targets run in CI |
 | M1 | Conversion core | Typed formats, resource model, diagnostics, and invariant tests |
 | M2 | Jupytext formats | Common Markdown/script formats and language registry pass fixtures |
 | M3 | Pairing and sync | Multi-pair configuration and conflict-safe synchronization work |
