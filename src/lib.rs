@@ -606,9 +606,7 @@ impl Writer for FileWriter {
         if self.atomic {
             atomic_write(&output, result.body.as_bytes())?;
         } else {
-            if let Some(parent) = output.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            fs::create_dir_all(output.parent().expect("export output has a parent"))?;
             fs::write(&output, &result.body)?;
         }
         if !result.resources.outputs.is_empty() {
@@ -623,9 +621,7 @@ impl Writer for FileWriter {
                 if self.atomic {
                     atomic_write(&path, contents)?;
                 } else {
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
+                    fs::create_dir_all(path.parent().expect("resource output has a parent"))?;
                     fs::write(path, contents)?;
                 }
             }
@@ -1095,7 +1091,7 @@ pub fn script_to_notebook(
                 }
                 current = Some((options.0, options.1, Vec::new()));
             }
-            Some(ScriptMarker::End) if !percent => {
+            Some(ScriptMarker::End) => {
                 if let Some(cell) = current.take() {
                     push_script_cell(&mut cells, cell, default_language, comment_prefix);
                 }
@@ -1124,7 +1120,6 @@ pub fn script_to_notebook(
                     }
                 }
             }
-            Some(ScriptMarker::End) => {}
         }
     }
     if let Some(cell) = current.take() {
@@ -1255,7 +1250,8 @@ pub fn notebook_to_script(notebook: &NotebookV4, format: &str, language: &str) -
             output.push_str(" [markdown]");
         } else if cell_type == CellTypeTag::Raw {
             output.push_str(" [raw]");
-        } else if let Ok(metadata) = metadata_json(metadata) {
+        } else {
+            let metadata = metadata_json(metadata);
             if !metadata.is_empty() {
                 output.push(' ');
                 output.push_str(&metadata);
@@ -1451,9 +1447,7 @@ pub fn source_to_notebook(
 pub fn extract_resources(notebook: &NotebookV4) -> ResourceBundle {
     let mut resources = ResourceBundle::default();
     for (cell_index, cell) in notebook.cells.iter().enumerate() {
-        let Ok(value) = serde_json::to_value(cell) else {
-            continue;
-        };
+        let value = serde_json::to_value(cell).expect("notebook cells serialize to JSON");
         if let Some(attachments) = value
             .get("attachments")
             .and_then(serde_json::Value::as_object)
@@ -1593,9 +1587,6 @@ pub fn transform_file_with_input_format(
         .unwrap_or_else(|| detect_input_format(source, &source_text));
     let notebook = source_to_notebook(&source_text, &input_format.canonical_name(), options)?;
     let output_base = output_base.as_ref();
-    if let Some(parent) = output_base.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let parsed_formats = formats
         .iter()
         .map(|format| FormatId::parse(format))
@@ -2338,32 +2329,31 @@ fn metadata_is_empty(metadata: &CellMetadata) -> bool {
         .unwrap_or(true)
 }
 
-fn metadata_json(metadata: &CellMetadata) -> Result<String, TransformError> {
-    let mut value = serde_json::to_value(metadata)?;
-    if let Some(object) = value.as_object_mut() {
-        object.remove("language");
-    }
+fn metadata_json(metadata: &CellMetadata) -> String {
+    let mut value = serde_json::to_value(metadata).expect("cell metadata serializes to JSON");
+    value
+        .as_object_mut()
+        .expect("cell metadata serializes as an object")
+        .remove("language");
     if value.as_object().is_none_or(|object| object.is_empty()) {
-        return Ok(String::new());
+        return String::new();
     }
-    Ok(serde_json::to_string(&value)?)
+    serde_json::to_string(&value).expect("cell metadata JSON serialization cannot fail")
 }
 
 fn append_myst_metadata(output: &mut String, metadata: &CellMetadata) {
-    let Ok(mut value) = serde_json::to_value(metadata) else {
-        return;
-    };
-    if let Some(object) = value.as_object_mut() {
-        object.remove("language");
-    }
+    let mut value = serde_json::to_value(metadata).expect("cell metadata serializes to JSON");
+    value
+        .as_object_mut()
+        .expect("cell metadata serializes as an object")
+        .remove("language");
     if value.as_object().is_none_or(|object| object.is_empty()) {
         return;
     }
-    if let Ok(yaml) = serde_yaml::to_string(&value) {
-        output.push_str("---\n");
-        output.push_str(&yaml);
-        output.push_str("---\n");
-    }
+    let yaml = serde_yaml::to_string(&value).expect("cell metadata YAML serialization cannot fail");
+    output.push_str("---\n");
+    output.push_str(&yaml);
+    output.push_str("---\n");
 }
 
 fn html_region_start(kind: &str, metadata: &CellMetadata) -> String {
@@ -3341,5 +3331,396 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.version, 1);
+    }
+
+    #[test]
+    fn covers_remaining_exporter_writer_and_preprocessor_edges() {
+        let notebook = NotebookV4 {
+            metadata: nbformat::v4::Metadata::default(),
+            nbformat: 4,
+            nbformat_minor: 5,
+            cells: vec![
+                Cell::Markdown {
+                    id: cell_id(0),
+                    metadata: CellMetadata::default(),
+                    source: vec!["text".into()],
+                    attachments: None,
+                },
+                Cell::Raw {
+                    id: cell_id(1),
+                    metadata: CellMetadata::default(),
+                    source: vec!["raw".into()],
+                },
+                Cell::Code {
+                    id: cell_id(2),
+                    metadata: CellMetadata::default(),
+                    execution_count: Some(2),
+                    source: vec!["value = 1".into()],
+                    outputs: vec![Output::Stream {
+                        name: "stdout".into(),
+                        text: nbformat::v4::MultilineString("one".into()),
+                    }],
+                },
+            ],
+        };
+        let options = ExportOptions {
+            extract_resources: false,
+            retain_outputs: false,
+            retain_execution_counts: true,
+        };
+        let exported = BasicExporter::with_options(FormatId::Notebook, options)
+            .export(&notebook)
+            .unwrap();
+        assert!(!exported.body.contains("stdout"));
+        assert!(exported.body.contains("execution_count"));
+
+        assert!(notebook_to_markdown(&notebook).ends_with('\n'));
+        let empty_notebook = NotebookV4 {
+            cells: Vec::new(),
+            ..notebook.clone()
+        };
+        assert!(notebook_to_markdown(&empty_notebook).is_empty());
+        assert!(notebook_to_rst(&empty_notebook).is_empty());
+        assert!(notebook_to_asciidoc(&empty_notebook).is_empty());
+        let double_newline = NotebookV4 {
+            cells: vec![Cell::Markdown {
+                id: cell_id(0),
+                metadata: CellMetadata::default(),
+                source: vec!["text\n\n".into()],
+                attachments: None,
+            }],
+            ..notebook.clone()
+        };
+        assert!(notebook_to_rst(&double_newline).ends_with("\n\n"));
+        let markdown_without_newline = NotebookV4 {
+            cells: vec![Cell::Markdown {
+                id: cell_id(0),
+                metadata: CellMetadata::default(),
+                source: vec!["text".into()],
+                attachments: None,
+            }],
+            ..notebook.clone()
+        };
+        assert_eq!(notebook_to_markdown(&markdown_without_newline), "text\n");
+        assert!(notebook_to_rst(&notebook).contains("raw"));
+        assert!(notebook_to_asciidoc(&notebook).contains("raw"));
+        assert!(notebook_to_script(&notebook, "light", "python").contains("# + [raw]"));
+        assert!(source_to_notebook("text", "html", &TransformOptions::default()).is_err());
+        let default_language =
+            markdown_to_notebook("```\nvalue = 1\n```\n", &TransformOptions::default()).unwrap();
+        assert_eq!(
+            default_language.cells[0]
+                .metadata()
+                .additional
+                .get("language")
+                .and_then(serde_json::Value::as_str),
+            Some("python")
+        );
+        assert!(markdown_to_notebook("```raw\nraw\n```\n", &TransformOptions::default(),).is_ok());
+        assert!(
+            markdown_to_notebook("```{raw-cell}\nraw\n```\n", &TransformOptions::default(),)
+                .is_ok()
+        );
+
+        let attachment_notebook = match nbformat::parse_notebook(
+            r##"{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"markdown","id":"cell-0","metadata":{},"source":"image","attachments":{"image.png":{"image/png":"SGk="}}}]}"##,
+        )
+        .unwrap()
+        {
+            Notebook::V4(notebook) => notebook,
+            _ => panic!("expected v4 notebook"),
+        };
+        assert_eq!(
+            extract_resources(&attachment_notebook).outputs["cell-0/attachment-image.png.png"],
+            b"Hi"
+        );
+
+        let mut resources = ResourceBundle::default();
+        collect_mime_resources(&mut resources, &serde_json::Value::Null, "empty".into());
+        collect_mime_resources(
+            &mut resources,
+            &serde_json::json!({
+                "image/jpeg": "SGk=",
+                "image/svg+xml": "<svg />",
+                "application/pdf": "invalid!",
+                "text/html": "<p>hi</p>",
+                "application/javascript": "alert(1)",
+                "text/javascript": "alert(2)",
+                "application/octet-stream": "ignored",
+                "image/png": [1, 2, 3]
+            }),
+            "cell-0/output-0".into(),
+        );
+        assert_eq!(resources.outputs["cell-0/output-0.jpg"], b"Hi");
+        assert_eq!(resources.outputs["cell-0/output-0.pdf"], b"invalid!");
+        assert_eq!(resources.outputs["cell-0/output-0.html"], b"<p>hi</p>");
+        assert_eq!(resources.outputs["cell-0/output-0.js"], b"alert(2)");
+        assert_eq!(resource_extension("image/png"), Some("png"));
+        assert_eq!(resource_extension("image/jpeg"), Some("jpg"));
+        assert_eq!(resource_extension("image/svg+xml"), Some("svg"));
+        assert_eq!(resource_extension("application/pdf"), Some("pdf"));
+        assert_eq!(resource_extension("text/html"), Some("html"));
+        assert_eq!(resource_extension("application/javascript"), Some("js"));
+        assert_eq!(resource_extension("unknown"), None);
+        assert_eq!(decode_base64(" S G k = "), Some(b"Hi".to_vec()));
+        assert_eq!(decode_base64("invalid!"), None);
+
+        let directory = tempfile::tempdir().unwrap();
+        let result = ExportResult {
+            body: "body".into(),
+            mime_type: "text/plain".into(),
+            output_extension: "txt".into(),
+            resources: ResourceBundle {
+                outputs: BTreeMap::from([("nested/asset.bin".into(), b"asset".to_vec())]),
+                metadata: BTreeMap::new(),
+            },
+        };
+        let output_base = directory.path().join("non-atomic/note");
+        let writer = FileWriter::new(true, false);
+        write_export(&writer, &result, &output_base).unwrap();
+        assert_eq!(
+            fs::read(output_base.with_extension("txt")).unwrap(),
+            b"body"
+        );
+        assert_eq!(
+            fs::read(
+                directory
+                    .path()
+                    .join("non-atomic/resources/nested/asset.bin")
+            )
+            .unwrap(),
+            b"asset"
+        );
+        let no_overwrite = FileWriter::new(false, false);
+        assert!(write_export(&no_overwrite, &result, &output_base).is_err());
+        let new_output_base = directory.path().join("non-atomic/new-note");
+        write_export(&no_overwrite, &result, &new_output_base).unwrap();
+
+        let mut preprocess_notebook = notebook.clone();
+        let mut preprocess_resources = ResourceBundle {
+            outputs: BTreeMap::from([("asset".into(), vec![1])]),
+            metadata: BTreeMap::from([("asset".into(), serde_json::Value::Null)]),
+        };
+        assert_eq!(ClearOutputs.name(), "clear_outputs");
+        assert_eq!(ResetExecutionCounts.name(), "reset_execution_counts");
+        assert_eq!(CoalesceStreams.name(), "coalesce_streams");
+        ClearOutputs
+            .process(&mut preprocess_notebook, &mut preprocess_resources)
+            .unwrap();
+        assert!(preprocess_resources.outputs.is_empty());
+        ResetExecutionCounts
+            .process(&mut preprocess_notebook, &mut ResourceBundle::default())
+            .unwrap();
+        CoalesceStreams
+            .process(&mut preprocess_notebook, &mut ResourceBundle::default())
+            .unwrap();
+        let mut distinct_streams = match nbformat::parse_notebook(
+            r##"{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"code","id":"cell-0","metadata":{},"execution_count":null,"source":"","outputs":[{"output_type":"stream","name":"stdout","text":"one"},{"output_type":"stream","name":"stderr","text":"two"}]}]}"##,
+        )
+        .unwrap()
+        {
+            Notebook::V4(notebook) => notebook,
+            _ => panic!("expected v4 notebook"),
+        };
+        CoalesceStreams
+            .process(&mut distinct_streams, &mut ResourceBundle::default())
+            .unwrap();
+        match &distinct_streams.cells[0] {
+            Cell::Code { outputs, .. } => assert_eq!(outputs.len(), 2),
+            _ => panic!("expected code cell"),
+        }
+    }
+
+    #[test]
+    fn covers_detection_sync_and_manifest_decisions() {
+        assert_eq!(
+            detect_input_format(Path::new("note.qmd"), ""),
+            FormatId::Quarto
+        );
+        assert_eq!(
+            detect_input_format(Path::new("note.REST"), ""),
+            FormatId::Rst
+        );
+        assert_eq!(
+            detect_input_format(Path::new("note.ASCIIDOC"), ""),
+            FormatId::AsciiDoc
+        );
+        assert_eq!(
+            detect_input_format(Path::new("note.rst"), ""),
+            FormatId::Rst
+        );
+        assert_eq!(
+            detect_input_format(Path::new("note.adoc"), ""),
+            FormatId::AsciiDoc
+        );
+        assert_eq!(
+            detect_input_format(Path::new("note.unknown"), ""),
+            FormatId::Markdown
+        );
+        assert_eq!(
+            detect_input_format(Path::new("note.py"), "value = 1\n"),
+            FormatId::Script {
+                language: "python".into(),
+                kind: ScriptKind::Light,
+            }
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let notebook_path = directory.path().join("newer.ipynb");
+        let text_path = directory.path().join("newer.md");
+        fs::write(&text_path, "old\n").unwrap();
+        let newer_notebook = markdown_to_notebook("new\n", &TransformOptions::default()).unwrap();
+        fs::write(&notebook_path, notebook_to_json(&newer_notebook).unwrap()).unwrap();
+        let result = sync_pair(
+            &notebook_path,
+            &text_path,
+            "myst",
+            &TransformOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.direction, SyncDirection::NotebookToText);
+
+        let notebook_path = directory.path().join("older.ipynb");
+        let text_path = directory.path().join("older.md");
+        let older_notebook = markdown_to_notebook("old\n", &TransformOptions::default()).unwrap();
+        fs::write(&notebook_path, notebook_to_json(&older_notebook).unwrap()).unwrap();
+        fs::write(&text_path, "newer\n").unwrap();
+        let result = sync_pair(
+            &notebook_path,
+            &text_path,
+            "myst",
+            &TransformOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.direction, SyncDirection::TextToNotebook);
+
+        let notebook_path = directory.path().join("conflict.ipynb");
+        let text_path = directory.path().join("conflict.md");
+        fs::write(&notebook_path, notebook_to_json(&older_notebook).unwrap()).unwrap();
+        fs::write(&text_path, "newer\n").unwrap();
+        std::process::Command::new("touch")
+            .args([
+                "-r",
+                &notebook_path.to_string_lossy(),
+                &text_path.to_string_lossy(),
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            sync_pair(
+                &notebook_path,
+                &text_path,
+                "myst",
+                &TransformOptions::default(),
+            )
+            .is_err()
+        );
+
+        let source_root = directory.path().join("sources");
+        fs::create_dir_all(&source_root).unwrap();
+        let source = source_root.join("note.md");
+        fs::write(&source, "current\n").unwrap();
+        let hash = sha256_path(&source).unwrap();
+        let existing_output = directory.path().join("existing.txt");
+        fs::write(&existing_output, "output").unwrap();
+        let current = ManifestFile {
+            source: "note.md".into(),
+            sha256: hash.clone(),
+            outputs: BTreeMap::from([(
+                "txt".into(),
+                existing_output.to_string_lossy().into_owned(),
+            )]),
+            transformed_sha256: Some(hash.clone()),
+            transformed_fingerprint: Some("fingerprint".into()),
+            ..ManifestFile::default()
+        };
+        let mut manifest = TransformManifest {
+            source_root: source_root.clone(),
+            transform_fingerprint: "fingerprint".into(),
+            files: BTreeMap::from([("current".into(), current)]),
+            ..TransformManifest::default()
+        };
+        assert!(changed_manifest_files(&manifest).is_empty());
+        manifest.files.insert(
+            "missing-source".into(),
+            ManifestFile {
+                source: "missing.md".into(),
+                sha256: hash.clone(),
+                transformed_sha256: Some(hash.clone()),
+                transformed_fingerprint: Some("fingerprint".into()),
+                ..ManifestFile::default()
+            },
+        );
+        manifest.files.insert(
+            "missing-output".into(),
+            ManifestFile {
+                source: "note.md".into(),
+                sha256: hash.clone(),
+                outputs: BTreeMap::from([("txt".into(), "missing.txt".into())]),
+                transformed_sha256: Some(hash.clone()),
+                transformed_fingerprint: Some("fingerprint".into()),
+                ..ManifestFile::default()
+            },
+        );
+        manifest.files.insert(
+            "stale-fingerprint".into(),
+            ManifestFile {
+                source: "note.md".into(),
+                sha256: hash.clone(),
+                transformed_sha256: Some(hash.clone()),
+                transformed_fingerprint: Some("old".into()),
+                ..ManifestFile::default()
+            },
+        );
+        let changed = changed_manifest_files(&manifest);
+        assert!(changed.contains(&"missing-source".into()));
+        assert!(changed.contains(&"missing-output".into()));
+        assert!(changed.contains(&"stale-fingerprint".into()));
+        assert!(metadata_from_yaml("jupyter: 1\n").is_ok());
+        assert!(parse_cell_options("").is_ok());
+        assert!(script_to_notebook("# %%[markdown]\n# title\n", "percent", "python").is_ok());
+        assert!(matches!(
+            parse_script_options("{\"tags\": 1}").0,
+            CellTypeTag::Code
+        ));
+        assert!(script_to_notebook("```\nvalue = 1\n```\n", "percent", "python").is_ok());
+
+        let empty_output_manifest = TransformManifest {
+            output_formats: vec!["myst".into()],
+            files: BTreeMap::from([(
+                "note.md".into(),
+                ManifestFile {
+                    source: "note.md".into(),
+                    sha256: "different".into(),
+                    outputs: BTreeMap::from([("myst".into(), String::new())]),
+                    ..ManifestFile::default()
+                },
+            )]),
+            ..manifest
+        };
+        let empty_output_path = directory.path().join("empty-output.json");
+        fs::write(
+            &empty_output_path,
+            serde_json::to_string(&empty_output_manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(transform_manifest(&empty_output_path, false).is_err());
+
+        let source_without_parent = directory.path().join("no-parent.md");
+        fs::write(&source_without_parent, "text\n").unwrap();
+        assert!(
+            transform_file(
+                &source_without_parent,
+                Path::new(""),
+                &[],
+                &TransformOptions::default(),
+            )
+            .is_ok()
+        );
+
+        let atomic_error = atomic_write(Path::new(""), b"unused");
+        assert!(atomic_error.is_err());
+        let temporary = PathBuf::from(format!(".output.tmp-{}", std::process::id()));
+        let _ = fs::remove_file(temporary);
     }
 }
