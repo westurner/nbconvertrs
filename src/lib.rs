@@ -1,5 +1,17 @@
-//! Jupytext-compatible Markdown transforms used by the sustainablefactory
-//! workflow and optionally by DocIndex.
+//! Jupytext-compatible notebook and text transforms.
+//!
+//! The crate provides three layers of functionality:
+//!
+//! - typed format discovery through [`FormatId`] and [`LanguageSpec`];
+//! - in-memory conversion through [`Exporter`] and the `*_to_*` functions; and
+//! - filesystem workflows through [`transform_file`], [`sync_pair`], and the
+//!   manifest helpers.
+//!
+//! Conversion is deliberately non-executing. Code cells are parsed and
+//! rendered as source text; kernel execution and rich-output extraction remain
+//! separate compatibility milestones. The [`TransformOptions`] value controls
+//! parsing behavior without requiring filesystem access.
+#![warn(missing_docs)]
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -11,78 +23,416 @@ use nbformat::v4::{Cell, CellId, CellMetadata, Notebook as NotebookV4};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Errors returned by parsing, conversion, export, and workflow operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TransformError {
+    /// An input or output path could not be read, created, or replaced.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The notebook model rejected the input or could not be serialized.
     #[error("notebook error: {0}")]
     Notebook(#[from] nbformat::NotebookError),
+    /// A JSON value could not be parsed or serialized.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// A source document or workflow setting is malformed.
     #[error("invalid transform configuration: {0}")]
     Configuration(String),
+    /// The requested format is not registered by this crate.
     #[error("unsupported output format {0:?}")]
     UnsupportedFormat(String),
 }
 
+/// A normalized format requested by a caller or detected from a path.
+///
+/// Use [`FormatId::parse`] at API boundaries. The parser accepts canonical
+/// names and aliases such as `markdown`, `notebook`, and `py:percent`, then
+/// stores a single canonical representation for dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FormatId {
+    /// MyST-compatible Markdown text.
+    Markdown,
+    /// Jupyter notebook JSON (`.ipynb`).
+    Notebook,
+    /// Static HTML source rendering.
+    Html,
+    /// A Jupytext-style script with a language-specific comment prefix.
+    Script {
+        /// Canonical name of the script language.
+        language: String,
+        /// Cell-marker convention used by the script.
+        kind: ScriptKind,
+    },
+}
+
+/// The cell-marker convention used by a script format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScriptKind {
+    /// A script whose cells begin with markers such as `# %%`.
+    Percent,
+    /// A script whose cells are delimited by markers such as `# +` and `# -`.
+    Light,
+}
+
+/// Static information used to parse and render a script language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageSpec {
+    /// Canonical language name used in [`FormatId::Script`].
+    pub name: &'static str,
+    /// Case-insensitive file extensions accepted for this language.
+    pub extensions: &'static [&'static str],
+    /// Comment prefix used for cell markers and Markdown source lines.
+    pub comment_prefix: &'static str,
+}
+
+const LANGUAGE_SPECS: &[LanguageSpec] = &[
+    LanguageSpec {
+        name: "python",
+        extensions: &["py"],
+        comment_prefix: "#",
+    },
+    LanguageSpec {
+        name: "r",
+        extensions: &["R", "r"],
+        comment_prefix: "#",
+    },
+    LanguageSpec {
+        name: "julia",
+        extensions: &["jl"],
+        comment_prefix: "#",
+    },
+    LanguageSpec {
+        name: "matlab",
+        extensions: &["m"],
+        comment_prefix: "%",
+    },
+    LanguageSpec {
+        name: "javascript",
+        extensions: &["js"],
+        comment_prefix: "//",
+    },
+    LanguageSpec {
+        name: "typescript",
+        extensions: &["ts"],
+        comment_prefix: "//",
+    },
+    LanguageSpec {
+        name: "ruby",
+        extensions: &["rb"],
+        comment_prefix: "#",
+    },
+    LanguageSpec {
+        name: "shell",
+        extensions: &["sh", "bash"],
+        comment_prefix: "#",
+    },
+    LanguageSpec {
+        name: "rust",
+        extensions: &["rs"],
+        comment_prefix: "//",
+    },
+    LanguageSpec {
+        name: "sql",
+        extensions: &["sql"],
+        comment_prefix: "--",
+    },
+];
+
+/// Return the registered script languages understood by the text pipeline.
+///
+/// The returned slice is static and sorted by the crate's built-in registry,
+/// so callers may use it for completion or configuration validation without
+/// allocating or holding a lock.
+pub fn language_specs() -> &'static [LanguageSpec] {
+    LANGUAGE_SPECS
+}
+
+/// A format descriptor suitable for discovery and UI/configuration code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatDescriptor {
+    /// Canonical format name accepted by [`FormatId::parse`].
+    pub name: &'static str,
+    /// Additional names accepted as aliases.
+    pub aliases: &'static [&'static str],
+    /// File extensions associated with the format.
+    pub extensions: &'static [&'static str],
+    /// Whether conversion is intended to preserve notebook semantics in both
+    /// directions.
+    pub round_trip: bool,
+}
+
+const FORMAT_DESCRIPTORS: &[FormatDescriptor] = &[
+    FormatDescriptor {
+        name: "myst",
+        aliases: &["md", "markdown"],
+        extensions: &["md", "markdown", "myst.md"],
+        round_trip: true,
+    },
+    FormatDescriptor {
+        name: "ipynb",
+        aliases: &["notebook"],
+        extensions: &["ipynb"],
+        round_trip: true,
+    },
+    FormatDescriptor {
+        name: "html",
+        aliases: &[],
+        extensions: &["html"],
+        round_trip: false,
+    },
+];
+
+/// Return descriptors for the built-in non-language-specific formats.
+///
+/// Script formats are described separately by [`language_specs`], because a
+/// script format combines a language and a [`ScriptKind`].
+pub fn format_descriptors() -> &'static [FormatDescriptor] {
+    FORMAT_DESCRIPTORS
+}
+
+impl FormatId {
+    /// Parse a Jupytext-style format name such as `myst` or `py:percent`.
+    pub fn parse(value: &str) -> Result<Self, TransformError> {
+        match value.to_ascii_lowercase().as_str() {
+            "myst" | "md" | "markdown" => Ok(Self::Markdown),
+            "ipynb" | "notebook" => Ok(Self::Notebook),
+            "html" => Ok(Self::Html),
+            _ => {
+                let Some((language, kind)) = value.split_once(':') else {
+                    return Err(TransformError::UnsupportedFormat(value.into()));
+                };
+                let language = language_spec(language)
+                    .ok_or_else(|| TransformError::UnsupportedFormat(value.into()))?;
+                let kind = match kind.to_ascii_lowercase().as_str() {
+                    "percent" => ScriptKind::Percent,
+                    "light" => ScriptKind::Light,
+                    _ => return Err(TransformError::UnsupportedFormat(value.into())),
+                };
+                Ok(Self::Script {
+                    language: language.name.into(),
+                    kind,
+                })
+            }
+        }
+    }
+
+    /// Return the canonical CLI/configuration spelling for this format.
+    pub fn canonical_name(&self) -> String {
+        match self {
+            Self::Markdown => "myst".into(),
+            Self::Notebook => "ipynb".into(),
+            Self::Html => "html".into(),
+            Self::Script { language, kind } => format!(
+                "{}:{}",
+                language,
+                match kind {
+                    ScriptKind::Percent => "percent",
+                    ScriptKind::Light => "light",
+                }
+            ),
+        }
+    }
+
+    fn output_suffix(&self) -> String {
+        match self {
+            Self::Markdown => "myst.md".into(),
+            Self::Notebook => "ipynb".into(),
+            Self::Html => "html".into(),
+            Self::Script { language, .. } => language_spec(language)
+                .and_then(|spec| spec.extensions.first().copied())
+                .unwrap_or(language)
+                .into(),
+        }
+    }
+}
+
+fn language_spec(value: &str) -> Option<&'static LanguageSpec> {
+    LANGUAGE_SPECS.iter().find(|spec| {
+        spec.name.eq_ignore_ascii_case(value)
+            || spec
+                .extensions
+                .iter()
+                .any(|extension| extension.eq_ignore_ascii_case(value))
+    })
+}
+
+/// Output resources collected by an exporter without writing to disk.
+///
+/// The current built-in text exporters leave this bundle empty. It is part of
+/// the public result now so future image, JavaScript, and template exporters
+/// can add resources without changing the exporter contract.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceBundle {
+    /// Named binary resources, such as extracted images.
+    pub outputs: BTreeMap<String, Vec<u8>>,
+    /// String-keyed exporter metadata and configuration results.
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// The body and resources produced by an in-memory export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportResult {
+    /// The rendered document or serialized notebook body.
+    pub body: String,
+    /// MIME type for [`ExportResult::body`].
+    pub mime_type: String,
+    /// File extension to use when writing the body.
+    pub output_extension: String,
+    /// Supporting resources produced during the export.
+    pub resources: ResourceBundle,
+}
+
+/// In-memory exporter contract shared by text and future rendered exporters.
+pub trait Exporter {
+    /// Return the normalized format implemented by this exporter.
+    fn format(&self) -> &FormatId;
+    /// Export one notebook without reading or writing files.
+    fn export(&self, notebook: &NotebookV4) -> Result<ExportResult, TransformError>;
+}
+
+/// Built-in exporter for notebook JSON, MyST Markdown, scripts, and static
+/// HTML.
+#[derive(Debug, Clone)]
+pub struct BasicExporter {
+    format: FormatId,
+}
+
+impl BasicExporter {
+    /// Construct an exporter for a normalized format.
+    pub fn new(format: FormatId) -> Self {
+        Self { format }
+    }
+}
+
+impl Exporter for BasicExporter {
+    fn format(&self) -> &FormatId {
+        &self.format
+    }
+
+    fn export(&self, notebook: &NotebookV4) -> Result<ExportResult, TransformError> {
+        let (body, mime_type) = match &self.format {
+            FormatId::Markdown => (notebook_to_markdown(notebook), "text/markdown"),
+            FormatId::Notebook => (notebook_to_json(notebook)?, "application/x-ipynb+json"),
+            FormatId::Html => (notebook_to_html(notebook), "text/html"),
+            FormatId::Script { language, kind } => (
+                notebook_to_script(
+                    notebook,
+                    match kind {
+                        ScriptKind::Percent => "percent",
+                        ScriptKind::Light => "light",
+                    },
+                    language,
+                ),
+                "text/plain",
+            ),
+        };
+        Ok(ExportResult {
+            body,
+            mime_type: mime_type.into(),
+            output_extension: self.format.output_suffix(),
+            resources: ResourceBundle::default(),
+        })
+    }
+}
+
+/// Export a notebook using a canonical format name or supported alias.
+///
+/// This is the convenience form of [`BasicExporter`] for callers that receive
+/// format names from configuration or command-line input.
+pub fn export_notebook(
+    notebook: &NotebookV4,
+    format: &str,
+) -> Result<ExportResult, TransformError> {
+    BasicExporter::new(FormatId::parse(format)?).export(notebook)
+}
+
+/// Options controlling parsing and conversion behavior.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransformOptions {
     /// Split Markdown cells before level-one headings when set to `m1`.
     pub cell_split: Option<String>,
 }
 
+/// A filesystem output created by [`transform_file`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransformOutput {
+    /// Path of the output file.
     pub path: PathBuf,
+    /// Format name supplied by the caller.
     pub format: String,
 }
 
+/// Per-source state stored in an incremental transform manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ManifestFile {
+    /// Path relative to [`TransformManifest::source_root`].
     pub source: String,
+    /// SHA-256 hash of the source at the last scan.
     pub sha256: String,
+    /// Source size recorded by the workflow scanner.
     #[serde(default)]
     pub size: u64,
+    /// Workflow tags associated with the source.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Output format names mapped to their target paths.
     #[serde(default)]
     pub outputs: BTreeMap<String, String>,
+    /// Hash of the source used for the last successful transform.
     #[serde(default)]
     pub transformed_sha256: Option<String>,
+    /// Configuration fingerprint used for the last successful transform.
     #[serde(default)]
     pub transformed_fingerprint: Option<String>,
+    /// Human-readable workflow state.
     #[serde(default)]
     pub status: String,
 }
 
+/// Incremental workflow configuration and source records.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TransformManifest {
+    /// Serialized manifest schema version.
     #[serde(default = "manifest_version")]
     pub version: u32,
+    /// Root directory containing source files.
     pub source_root: PathBuf,
+    /// Directory used for final output paths.
     pub output_dir: PathBuf,
+    /// Optional directory for temporary atomic-transform files.
     #[serde(default)]
     pub temp_dir: Option<PathBuf>,
+    /// Output format names used when a record does not provide its own list.
     #[serde(default)]
     pub output_formats: Vec<String>,
+    /// Configuration fingerprint used for invalidation.
     #[serde(default)]
     pub transform_fingerprint: String,
+    /// Source records keyed by workflow-relative name.
     #[serde(default)]
     pub files: BTreeMap<String, ManifestFile>,
+    /// Summary from the last completed transform.
     #[serde(default)]
     pub last_transform: Option<TransformSummary>,
 }
 
+/// Counts produced by an incremental workflow operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransformSummary {
+    /// Number of records transformed.
     pub transformed: usize,
+    /// Number of records that were already current.
     pub skipped: usize,
 }
 
+/// Settings loaded from a sustainablefactory `_toc.yml` workflow file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowConfig {
+    /// Manifest path resolved relative to the configuration file.
     pub manifest: PathBuf,
+    /// Formats requested by the workflow.
     pub output_formats: Vec<String>,
+    /// Optional Markdown cell-splitting mode.
     pub cell_split: Option<String>,
 }
 
@@ -91,6 +441,11 @@ fn manifest_version() -> u32 {
 }
 
 /// Convert a Jupytext-style Markdown document into an nbformat v4 notebook.
+///
+/// Markdown outside recognized regions becomes a Markdown cell. Fenced code,
+/// raw-cell directives, YAML front matter, and supported HTML regions are
+/// preserved according to the format rules documented in the package README.
+/// The function never executes code.
 pub fn markdown_to_notebook(
     source: &str,
     options: &TransformOptions,
@@ -139,7 +494,6 @@ pub fn markdown_to_notebook(
                 ));
             }
             let source = body.concat();
-            let source = source;
             let metadata = metadata.unwrap_or_default();
             let id = cell_id(index);
             if cell_type == CellTypeTag::Raw {
@@ -234,6 +588,10 @@ pub fn markdown_to_notebook(
 }
 
 /// Convert a Jupytext percent or light script into an nbformat v4 notebook.
+///
+/// `format` must be `percent` or `light`; `default_language` selects the
+/// comment prefix and language metadata. Use [`FormatId::parse`] when the
+/// format is supplied as a combined name such as `py:percent`.
 pub fn script_to_notebook(
     source: &str,
     format: &str,
@@ -323,7 +681,7 @@ pub fn script_to_notebook(
     })
 }
 
-/// Render an nbformat v4 notebook in Jupytext Markdown form.
+/// Render an nbformat v4 notebook in Jupytext-compatible MyST Markdown form.
 pub fn notebook_to_markdown(notebook: &NotebookV4) -> String {
     let mut output = String::new();
     let metadata = serde_yaml::to_string(&notebook.metadata).unwrap();
@@ -387,6 +745,10 @@ pub fn notebook_to_markdown(notebook: &NotebookV4) -> String {
 }
 
 /// Render a notebook as a Jupytext percent or light script.
+///
+/// Markdown cells are comment-prefixed and code/raw cells retain their source
+/// text. The language controls both the comment prefix and output language
+/// metadata.
 pub fn notebook_to_script(notebook: &NotebookV4, format: &str, language: &str) -> String {
     let percent = format.eq_ignore_ascii_case("percent");
     let comment_prefix = script_comment_prefix(language);
@@ -457,6 +819,58 @@ pub fn notebook_to_script(notebook: &NotebookV4, format: &str, language: &str) -
     output
 }
 
+/// Render notebook source into a deterministic, dependency-free HTML document.
+///
+/// Cell source is escaped and placed in stable indexed sections. This is a
+/// static source renderer: it does not execute cells or render rich MIME
+/// outputs.
+pub fn notebook_to_html(notebook: &NotebookV4) -> String {
+    let mut output = String::from(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Notebook</title>\n</head>\n<body>\n",
+    );
+    for (index, cell) in notebook.cells.iter().enumerate() {
+        match cell {
+            Cell::Markdown { source, .. } => {
+                output.push_str(&format!(
+                    "<section class=\"cell markdown-cell\" data-cell-index=\"{index}\"><pre>{}</pre></section>\n",
+                    html_escape(&source.concat())
+                ));
+            }
+            Cell::Raw { source, .. } => {
+                output.push_str(&format!(
+                    "<section class=\"cell raw-cell\" data-cell-index=\"{index}\"><pre>{}</pre></section>\n",
+                    html_escape(&source.concat())
+                ));
+            }
+            Cell::Code {
+                metadata, source, ..
+            } => {
+                let language = metadata
+                    .additional
+                    .get("language")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("python");
+                output.push_str(&format!(
+                    "<section class=\"cell code-cell\" data-cell-index=\"{index}\"><pre><code class=\"language-{}\">{}</code></pre></section>\n",
+                    html_escape(language),
+                    html_escape(&source.concat())
+                ));
+            }
+        }
+    }
+    output.push_str("</body>\n</html>\n");
+    output
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 /// Serialize a notebook using runtimed's nbformat-compatible writer.
 pub fn notebook_to_json(notebook: &NotebookV4) -> Result<String, TransformError> {
     Ok(nbformat::serialize_notebook(&Notebook::V4(
@@ -464,73 +878,66 @@ pub fn notebook_to_json(notebook: &NotebookV4) -> Result<String, TransformError>
     ))?)
 }
 
-/// Convert Markdown to the requested output files using one in-process API.
+/// Convert one source file to the requested output files.
+///
+/// The input format is inferred from the extension and script markers. Use
+/// [`transform_file_with_input_format`] when inference is not sufficient.
 pub fn transform_file(
     source: impl AsRef<Path>,
     output_base: impl AsRef<Path>,
     formats: &[String],
     options: &TransformOptions,
 ) -> Result<Vec<TransformOutput>, TransformError> {
+    transform_file_with_input_format(source, output_base, formats, options, None)
+}
+
+/// Transform a file while allowing callers to override extension-based input detection.
+///
+/// `input_format` accepts the same names as [`FormatId::parse`]. Output files
+/// are written beneath `output_base` using each format's canonical extension.
+pub fn transform_file_with_input_format(
+    source: impl AsRef<Path>,
+    output_base: impl AsRef<Path>,
+    formats: &[String],
+    options: &TransformOptions,
+    input_format: Option<&str>,
+) -> Result<Vec<TransformOutput>, TransformError> {
     let source = source.as_ref();
     let source_text = fs::read_to_string(source)?;
-    let notebook = match source.extension().and_then(|value| value.to_str()) {
-        Some("ipynb") => match nbformat::parse_notebook(&source_text)? {
-            Notebook::V4(notebook) => notebook,
-            Notebook::V4QuirksMode(notebook) => notebook.repair(),
-            Notebook::Legacy(notebook) => nbformat::upgrade_legacy_notebook(notebook)
-                .map_err(|error| TransformError::Configuration(error.to_string()))?,
-            Notebook::V3(notebook) => nbformat::upgrade_v3_notebook(notebook)
-                .map_err(|error| TransformError::Configuration(error.to_string()))?,
-            _ => {
-                return Err(TransformError::Configuration(
-                    "unsupported notebook variant".into(),
-                ));
-            }
-        },
-        Some("py" | "R" | "jl" | "m") => {
-            let language = match source.extension().and_then(|value| value.to_str()) {
-                Some("R") => "r",
-                Some("jl") => "julia",
-                Some("m") => "matlab",
-                _ => "python",
-            };
-            let comment_prefix = script_comment_prefix(language);
-            let format = if source_text
-                .lines()
-                .any(|line| script_percent_marker(line, comment_prefix).is_some())
-            {
-                "percent"
-            } else {
-                "light"
-            };
-            script_to_notebook(&source_text, format, language)?
+    let input_format = input_format
+        .map(FormatId::parse)
+        .transpose()?
+        .unwrap_or_else(|| detect_input_format(source, &source_text));
+    let notebook = match input_format {
+        FormatId::Notebook => notebook_from_json(&source_text)?,
+        FormatId::Script { language, kind } => script_to_notebook(
+            &source_text,
+            match kind {
+                ScriptKind::Percent => "percent",
+                ScriptKind::Light => "light",
+            },
+            &language,
+        )?,
+        FormatId::Html => {
+            return Err(TransformError::Configuration(
+                "html is an output-only format".into(),
+            ));
         }
-        _ => markdown_to_notebook(&source_text, options)?,
+        FormatId::Markdown => markdown_to_notebook(&source_text, options)?,
     };
     let output_base = output_base.as_ref();
     if let Some(parent) = output_base.parent() {
         fs::create_dir_all(parent)?;
     }
+    let parsed_formats = formats
+        .iter()
+        .map(|format| FormatId::parse(format))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut outputs = Vec::new();
-    for format in formats {
-        let (suffix, contents) = match format.as_str() {
-            "myst" | "md" | "markdown" => ("myst.md", notebook_to_markdown(&notebook)),
-            "ipynb" | "notebook" => ("ipynb", notebook_to_json(&notebook)?),
-            value if value.ends_with(":percent") => {
-                let extension = value.split(':').next().unwrap_or("py");
-                (
-                    extension,
-                    notebook_to_script(&notebook, "percent", extension),
-                )
-            }
-            value if value.ends_with(":light") => {
-                let extension = value.split(':').next().unwrap_or("py");
-                (extension, notebook_to_script(&notebook, "light", extension))
-            }
-            other => return Err(TransformError::UnsupportedFormat(other.into())),
-        };
-        let path = output_base.with_extension(suffix);
-        fs::write(&path, contents)?;
+    for (format, parsed_format) in formats.iter().zip(parsed_formats) {
+        let exported = BasicExporter::new(parsed_format).export(&notebook)?;
+        let path = output_base.with_extension(&exported.output_extension);
+        fs::write(&path, exported.body)?;
         outputs.push(TransformOutput {
             path,
             format: format.clone(),
@@ -539,7 +946,203 @@ pub fn transform_file(
     Ok(outputs)
 }
 
-/// Load the workflow settings from the sustainablefactory `_toc.yml` shape.
+/// Detect a source format using the extension and, for scripts, marker content.
+///
+/// Unknown extensions default to [`FormatId::Markdown`]. This function only
+/// detects the format; it does not parse or validate the source body.
+pub fn detect_input_format(path: &Path, source: &str) -> FormatId {
+    let extension = path.extension().and_then(|value| value.to_str());
+    if extension.is_some_and(|value| value.eq_ignore_ascii_case("ipynb")) {
+        return FormatId::Notebook;
+    }
+    if let Some(spec) = extension.and_then(language_spec) {
+        let kind = if source
+            .lines()
+            .any(|line| script_percent_marker(line, spec.comment_prefix).is_some())
+        {
+            ScriptKind::Percent
+        } else {
+            ScriptKind::Light
+        };
+        return FormatId::Script {
+            language: spec.name.into(),
+            kind,
+        };
+    }
+    FormatId::Markdown
+}
+
+fn notebook_from_json(source: &str) -> Result<NotebookV4, TransformError> {
+    match nbformat::parse_notebook(source)? {
+        Notebook::V4(notebook) => Ok(notebook),
+        Notebook::V4QuirksMode(notebook) => Ok(notebook.repair()),
+        Notebook::Legacy(notebook) => nbformat::upgrade_legacy_notebook(notebook)
+            .map_err(|error| TransformError::Configuration(error.to_string())),
+        Notebook::V3(notebook) => nbformat::upgrade_v3_notebook(notebook)
+            .map_err(|error| TransformError::Configuration(error.to_string())),
+        _ => Err(TransformError::Configuration(
+            "unsupported notebook variant".into(),
+        )),
+    }
+}
+
+/// Direction selected while reconciling a notebook/text pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncDirection {
+    /// The notebook was authoritative and regenerated the text file.
+    NotebookToText,
+    /// The text file was authoritative and regenerated the notebook.
+    TextToNotebook,
+    /// Both files already represented the same canonical text.
+    Unchanged,
+}
+
+/// Result of synchronizing one notebook/text pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncResult {
+    /// Direction selected by the synchronization operation.
+    pub direction: SyncDirection,
+    /// Notebook path in the pair.
+    pub notebook: PathBuf,
+    /// Text path in the pair.
+    pub text: PathBuf,
+}
+
+/// Synchronize a notebook and one Jupytext-compatible text representation.
+///
+/// When both files differ, the newer file is authoritative. Equal timestamps
+/// are treated as a conflict so an automated workflow cannot overwrite edits.
+/// Missing files are created from the file that exists. Writes use a temporary
+/// sibling followed by an atomic rename.
+pub fn sync_pair(
+    notebook_path: impl AsRef<Path>,
+    text_path: impl AsRef<Path>,
+    text_format: &str,
+    options: &TransformOptions,
+) -> Result<SyncResult, TransformError> {
+    let notebook_path = notebook_path.as_ref().to_owned();
+    let text_path = text_path.as_ref().to_owned();
+    let text_format_id = FormatId::parse(text_format)?;
+    if matches!(text_format_id, FormatId::Notebook | FormatId::Html) {
+        return Err(TransformError::Configuration(
+            "sync text format must not be ipynb".into(),
+        ));
+    }
+
+    let notebook_exists = notebook_path.is_file();
+    let text_exists = text_path.is_file();
+    match (notebook_exists, text_exists) {
+        (false, false) => {
+            return Err(TransformError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "sync pair has no notebook or text source",
+            )));
+        }
+        (true, false) => {
+            let notebook = notebook_from_json(&fs::read_to_string(&notebook_path)?)?;
+            let exported = BasicExporter::new(text_format_id).export(&notebook)?;
+            atomic_write(&text_path, exported.body.as_bytes())?;
+            return Ok(SyncResult {
+                direction: SyncDirection::NotebookToText,
+                notebook: notebook_path,
+                text: text_path,
+            });
+        }
+        (false, true) => {
+            let source = fs::read_to_string(&text_path)?;
+            let notebook = match &text_format_id {
+                FormatId::Markdown => markdown_to_notebook(&source, options)?,
+                FormatId::Script { language, kind } => script_to_notebook(
+                    &source,
+                    match kind {
+                        ScriptKind::Percent => "percent",
+                        ScriptKind::Light => "light",
+                    },
+                    language,
+                )?,
+                FormatId::Notebook | FormatId::Html => unreachable!(),
+            };
+            atomic_write(&notebook_path, notebook_to_json(&notebook)?.as_bytes())?;
+            return Ok(SyncResult {
+                direction: SyncDirection::TextToNotebook,
+                notebook: notebook_path,
+                text: text_path,
+            });
+        }
+        (true, true) => {}
+    }
+
+    let notebook = notebook_from_json(&fs::read_to_string(&notebook_path)?)?;
+    let text_source = fs::read_to_string(&text_path)?;
+    let text_notebook = match &text_format_id {
+        FormatId::Markdown => markdown_to_notebook(&text_source, options)?,
+        FormatId::Script { language, kind } => script_to_notebook(
+            &text_source,
+            match kind {
+                ScriptKind::Percent => "percent",
+                ScriptKind::Light => "light",
+            },
+            language,
+        )?,
+        FormatId::Notebook | FormatId::Html => unreachable!(),
+    };
+    let canonical_text = BasicExporter::new(text_format_id.clone())
+        .export(&notebook)?
+        .body;
+    if canonical_text == text_source {
+        return Ok(SyncResult {
+            direction: SyncDirection::Unchanged,
+            notebook: notebook_path,
+            text: text_path,
+        });
+    }
+
+    let notebook_modified = fs::metadata(&notebook_path)?.modified()?;
+    let text_modified = fs::metadata(&text_path)?.modified()?;
+    if notebook_modified == text_modified {
+        return Err(TransformError::Configuration(format!(
+            "sync conflict: both sources changed and have the same timestamp ({})",
+            notebook_path.display()
+        )));
+    }
+    if notebook_modified > text_modified {
+        let exported = BasicExporter::new(text_format_id).export(&notebook)?;
+        atomic_write(&text_path, exported.body.as_bytes())?;
+        Ok(SyncResult {
+            direction: SyncDirection::NotebookToText,
+            notebook: notebook_path,
+            text: text_path,
+        })
+    } else {
+        atomic_write(&notebook_path, notebook_to_json(&text_notebook)?.as_bytes())?;
+        Ok(SyncResult {
+            direction: SyncDirection::TextToNotebook,
+            notebook: notebook_path,
+            text: text_path,
+        })
+    }
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), TransformError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("output"),
+        std::process::id()
+    ));
+    fs::write(&temporary, contents)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+/// Load workflow settings from the sustainablefactory `_toc.yml` shape.
+///
+/// The loader searches nested mappings for `output_formats` and resolves a
+/// relative `manifest` path against the configuration file's directory.
 pub fn load_workflow_config(path: impl AsRef<Path>) -> Result<WorkflowConfig, TransformError> {
     let path = path.as_ref();
     let source = fs::read_to_string(path)?;
@@ -580,6 +1183,9 @@ pub fn load_workflow_config(path: impl AsRef<Path>) -> Result<WorkflowConfig, Tr
 }
 
 /// Return manifest records whose source hash, transform fingerprint, or outputs are stale.
+///
+/// Missing source files count as stale. The returned names are the manifest
+/// keys, in map order.
 pub fn changed_manifest_files(manifest: &TransformManifest) -> Vec<String> {
     manifest
         .files
@@ -773,7 +1379,7 @@ enum CellTypeTag {
 }
 
 enum ScriptMarker {
-    Start((CellTypeTag, CellMetadata)),
+    Start(Box<(CellTypeTag, CellMetadata)>),
     End,
 }
 
@@ -937,7 +1543,7 @@ fn script_percent_marker(line: &str, comment_prefix: &str) -> Option<ScriptMarke
     {
         return None;
     }
-    Some(ScriptMarker::Start(parse_script_options(rest)))
+    Some(ScriptMarker::Start(Box::new(parse_script_options(rest))))
 }
 
 fn script_light_marker(line: &str, comment_prefix: &str) -> Option<ScriptMarker> {
@@ -947,14 +1553,13 @@ fn script_light_marker(line: &str, comment_prefix: &str) -> Option<ScriptMarker>
         return Some(ScriptMarker::End);
     }
     let options = rest.strip_prefix('+')?;
-    Some(ScriptMarker::Start(parse_script_options(options)))
+    Some(ScriptMarker::Start(Box::new(parse_script_options(options))))
 }
 
 fn script_comment_prefix(language: &str) -> &'static str {
-    match language.to_ascii_lowercase().as_str() {
-        "matlab" | "m" => "%",
-        _ => "#",
-    }
+    language_spec(language)
+        .map(|spec| spec.comment_prefix)
+        .unwrap_or("#")
 }
 
 fn parse_script_options(options: &str) -> (CellTypeTag, CellMetadata) {
@@ -1125,6 +1730,122 @@ mod tests {
         assert_eq!(notebook.cells.len(), 2);
         assert!(notebook.cells[0].source().concat().contains("# One"));
         assert!(notebook.cells[1].source().concat().contains("# Two"));
+    }
+
+    #[test]
+    fn format_registry_normalizes_aliases_and_scripts() {
+        assert_eq!(FormatId::parse("markdown").unwrap(), FormatId::Markdown);
+        assert_eq!(FormatId::parse("notebook").unwrap(), FormatId::Notebook);
+        assert_eq!(
+            FormatId::parse("py:percent").unwrap(),
+            FormatId::Script {
+                language: "python".into(),
+                kind: ScriptKind::Percent,
+            }
+        );
+        assert_eq!(
+            FormatId::parse("javascript:light")
+                .unwrap()
+                .canonical_name(),
+            "javascript:light"
+        );
+        assert!(FormatId::parse("python:unknown").is_err());
+        assert!(
+            format_descriptors()
+                .iter()
+                .any(|format| format.name == "myst")
+        );
+        assert!(
+            language_specs()
+                .iter()
+                .any(|language| language.name == "sql")
+        );
+    }
+
+    #[test]
+    fn detects_registered_script_languages_and_prefixes() {
+        let javascript = detect_input_format(
+            Path::new("example.js"),
+            "// %% [markdown]\n// Title\n// %%\nanswer = 1\n",
+        );
+        assert_eq!(
+            javascript,
+            FormatId::Script {
+                language: "javascript".into(),
+                kind: ScriptKind::Percent,
+            }
+        );
+        let notebook = script_to_notebook(
+            "// %% [markdown]\n// Title\n// %%\nanswer = 1\n",
+            "percent",
+            "javascript",
+        )
+        .unwrap();
+        assert_eq!(notebook.cells.len(), 2);
+        assert!(notebook_to_script(&notebook, "percent", "javascript").contains("// %%"));
+    }
+
+    #[test]
+    fn basic_exporter_returns_in_memory_result() {
+        let notebook = markdown_to_notebook(
+            "# Title\n\n```rust\nlet value = \"<safe>\";\n```\n",
+            &TransformOptions::default(),
+        )
+        .unwrap();
+        let result = export_notebook(&notebook, "markdown").unwrap();
+        assert_eq!(result.mime_type, "text/markdown");
+        assert_eq!(result.output_extension, "myst.md");
+        assert!(result.body.contains("# Title\n"));
+        assert!(result.resources.outputs.is_empty());
+
+        let script = export_notebook(&notebook, "py:percent").unwrap();
+        assert_eq!(script.mime_type, "text/plain");
+        assert_eq!(script.output_extension, "py");
+        assert!(script.body.contains("# %%"));
+
+        let html = export_notebook(&notebook, "html").unwrap();
+        assert_eq!(html.mime_type, "text/html");
+        assert_eq!(html.output_extension, "html");
+        assert!(html.body.contains("&lt;safe&gt;"));
+    }
+
+    #[test]
+    fn synchronizes_a_pair_without_rewriting_equivalent_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let notebook_path = directory.path().join("note.ipynb");
+        let text_path = directory.path().join("note.md");
+        let notebook = markdown_to_notebook("# Title\n", &TransformOptions::default()).unwrap();
+        fs::write(&notebook_path, notebook_to_json(&notebook).unwrap()).unwrap();
+
+        let created = sync_pair(
+            &notebook_path,
+            &text_path,
+            "myst",
+            &TransformOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(created.direction, SyncDirection::NotebookToText);
+        assert_eq!(fs::read_to_string(&text_path).unwrap(), "# Title\n");
+
+        let unchanged = sync_pair(
+            &notebook_path,
+            &text_path,
+            "myst",
+            &TransformOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(unchanged.direction, SyncDirection::Unchanged);
+
+        fs::remove_file(&notebook_path).unwrap();
+        let reconstructed = sync_pair(
+            &notebook_path,
+            &text_path,
+            "markdown",
+            &TransformOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(reconstructed.direction, SyncDirection::TextToNotebook);
+        assert!(notebook_path.is_file());
     }
 
     #[test]
@@ -1433,41 +2154,41 @@ mod tests {
 
     #[test]
     fn covers_parser_errors_and_alternate_cell_writers() {
-        assert!(markdown_to_notebook(
-            "<!-- #region -->\nbody\n",
-            &TransformOptions::default()
-        )
-        .is_err());
-        assert!(markdown_to_notebook(
-            "---\nnot: [closed\n---\n",
-            &TransformOptions::default()
-        )
-        .is_err());
-        assert!(markdown_to_notebook(
-            "---\n- list\n---\n",
-            &TransformOptions::default()
-        )
-        .is_err());
-        assert!(markdown_to_notebook(
-            "<!-- #region invalid -->\nbody\n<!-- #endregion -->\n",
-            &TransformOptions::default()
-        )
-        .is_err());
-        assert!(markdown_to_notebook(
-            "```python\n---\n- list\n---\ncode\n```\n",
-            &TransformOptions::default()
-        )
-        .is_err());
-        assert!(markdown_to_notebook(
-            "```python\n---\ntags: [one]\ncode\n",
-            &TransformOptions::default()
-        )
-        .is_err());
-        assert!(markdown_to_notebook(
-            "```python\n---\ntags: [one]\n```\n",
-            &TransformOptions::default()
-        )
-        .is_err());
+        assert!(
+            markdown_to_notebook("<!-- #region -->\nbody\n", &TransformOptions::default()).is_err()
+        );
+        assert!(
+            markdown_to_notebook("---\nnot: [closed\n---\n", &TransformOptions::default()).is_err()
+        );
+        assert!(markdown_to_notebook("---\n- list\n---\n", &TransformOptions::default()).is_err());
+        assert!(
+            markdown_to_notebook(
+                "<!-- #region invalid -->\nbody\n<!-- #endregion -->\n",
+                &TransformOptions::default()
+            )
+            .is_err()
+        );
+        assert!(
+            markdown_to_notebook(
+                "```python\n---\n- list\n---\ncode\n```\n",
+                &TransformOptions::default()
+            )
+            .is_err()
+        );
+        assert!(
+            markdown_to_notebook(
+                "```python\n---\ntags: [one]\ncode\n",
+                &TransformOptions::default()
+            )
+            .is_err()
+        );
+        assert!(
+            markdown_to_notebook(
+                "```python\n---\ntags: [one]\n```\n",
+                &TransformOptions::default()
+            )
+            .is_err()
+        );
         assert!(markdown_to_notebook("---\nname: value\n", &TransformOptions::default()).is_err());
         assert!(markdown_to_notebook("<!-- regular -->\n", &TransformOptions::default()).is_ok());
         assert!(region_start("<!-- #region").unwrap().is_none());
@@ -1476,7 +2197,10 @@ mod tests {
         assert!(!region_end("<!-- #endmarkdown -->", CellTypeTag::Code));
         assert!(metadata_from_value(serde_json::Value::Null).is_err());
         assert_eq!(
-            parse_script_options("{\"name\":\"named\"}").1.name.as_deref(),
+            parse_script_options("{\"name\":\"named\"}")
+                .1
+                .name
+                .as_deref(),
             Some("named")
         );
         assert_eq!(
@@ -1511,13 +2235,20 @@ mod tests {
         )
         .unwrap();
         assert!(notebook_to_script(&code_with_metadata, "light", "python").contains("tags"));
-        assert!(markdown_to_notebook(
-            "<!-- #markdown -->\ntext\n<!-- #endmarkdown -->\n",
-            &TransformOptions::default(),
-        )
-        .is_ok());
+        assert!(
+            markdown_to_notebook(
+                "<!-- #markdown -->\ntext\n<!-- #endmarkdown -->\n",
+                &TransformOptions::default(),
+            )
+            .is_ok()
+        );
         assert!(split_source("").is_empty());
-        assert!(script_to_notebook("# -\n", "light", "python").unwrap().cells.is_empty());
+        assert!(
+            script_to_notebook("# -\n", "light", "python")
+                .unwrap()
+                .cells
+                .is_empty()
+        );
 
         let raw_json = r##"{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"raw","metadata":{},"source":"raw"}]}"##;
         let raw = match nbformat::parse_notebook(raw_json).unwrap() {
@@ -1552,39 +2283,55 @@ mod tests {
         assert_eq!(light.cells.len(), 3);
         let plain = script_to_notebook("value = 1\n", "light", "python").unwrap();
         assert_eq!(plain.cells.len(), 1);
-        assert!(script_to_notebook("# %%not-a-marker\nvalue = 1\n", "percent", "python")
-            .unwrap()
-            .cells
-            .iter()
-            .any(|cell| matches!(cell, Cell::Code { .. })));
-        let marker_metadata = script_to_notebook(
-            "# %% {invalid-json}\nvalue = 1\n",
-            "percent",
-            "python",
-        )
-        .unwrap();
-        assert_eq!(marker_metadata.cells[0].metadata().name.as_deref(), Some("{invalid-json}"));
+        assert!(
+            script_to_notebook("# %%not-a-marker\nvalue = 1\n", "percent", "python")
+                .unwrap()
+                .cells
+                .iter()
+                .any(|cell| matches!(cell, Cell::Code { .. }))
+        );
+        let marker_metadata =
+            script_to_notebook("# %% {invalid-json}\nvalue = 1\n", "percent", "python").unwrap();
+        assert_eq!(
+            marker_metadata.cells[0].metadata().name.as_deref(),
+            Some("{invalid-json}")
+        );
 
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("input.md");
         let output = directory.path().join("nested/converted");
         fs::write(&source, "# Title\n\n```python\nprint(1)\n```\n").unwrap();
         let formats = [
-            "md", "markdown", "notebook", "py:light", "R:percent", "jl:light", "m:light",
+            "md",
+            "markdown",
+            "notebook",
+            "html",
+            "py:light",
+            "R:percent",
+            "jl:light",
+            "m:light",
         ]
         .into_iter()
         .map(String::from)
         .collect::<Vec<_>>();
-        let results = transform_file(&source, &output, &formats, &TransformOptions::default())
-            .unwrap();
+        let results =
+            transform_file(&source, &output, &formats, &TransformOptions::default()).unwrap();
         assert_eq!(results.len(), formats.len());
         assert!(output.with_extension("myst.md").is_file());
         assert!(output.with_extension("ipynb").is_file());
+        assert!(output.with_extension("html").is_file());
         assert!(output.with_extension("R").is_file());
         assert!(output.with_extension("jl").is_file());
         assert!(output.with_extension("m").is_file());
-        assert!(transform_file(&source, &output, &["unsupported".into()], &TransformOptions::default())
-            .is_err());
+        assert!(
+            transform_file(
+                &source,
+                &output,
+                &["unsupported".into()],
+                &TransformOptions::default()
+            )
+            .is_err()
+        );
 
         for (extension, source_text) in [
             ("py", "value = 1\n"),
@@ -1641,16 +2388,26 @@ mod tests {
         assert!(load_workflow_config(&config_path).is_err());
         fs::write(&config_path, "[invalid\n").unwrap();
         assert!(load_workflow_config(&config_path).is_err());
-        fs::write(&config_path, "output_formats: [myst]\nmanifest: ./manifest.json\n").unwrap();
+        fs::write(
+            &config_path,
+            "output_formats: [myst]\nmanifest: ./manifest.json\n",
+        )
+        .unwrap();
         let config = load_workflow_config(&config_path).unwrap();
         assert_eq!(config.manifest, directory.path().join("manifest.json"));
         let absolute_manifest = directory.path().join("absolute.json");
         fs::write(
             &config_path,
-            format!("output_formats: [myst]\nmanifest: {}\n", absolute_manifest.display()),
+            format!(
+                "output_formats: [myst]\nmanifest: {}\n",
+                absolute_manifest.display()
+            ),
         )
         .unwrap();
-        assert_eq!(load_workflow_config(&config_path).unwrap().manifest, absolute_manifest);
+        assert_eq!(
+            load_workflow_config(&config_path).unwrap().manifest,
+            absolute_manifest
+        );
 
         let source_root = directory.path().join("source");
         let output_dir = directory.path().join("output");
@@ -1674,7 +2431,12 @@ mod tests {
             ..TransformManifest::default()
         };
         fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
-        assert_eq!(transform_manifest(&manifest_path, true).unwrap().transformed, 1);
+        assert_eq!(
+            transform_manifest(&manifest_path, true)
+                .unwrap()
+                .transformed,
+            1
+        );
         assert!(transform_manifest(&manifest_path, false).is_err());
 
         let successful_manifest = TransformManifest {
@@ -1686,15 +2448,27 @@ mod tests {
                     sha256: sha256_path(&source).unwrap(),
                     outputs: BTreeMap::from([(
                         "myst".into(),
-                        output_dir.join("note.myst.md").to_string_lossy().into_owned(),
+                        output_dir
+                            .join("note.myst.md")
+                            .to_string_lossy()
+                            .into_owned(),
                     )]),
                     ..ManifestFile::default()
                 },
             )]),
             ..manifest.clone()
         };
-        fs::write(&manifest_path, serde_json::to_string(&successful_manifest).unwrap()).unwrap();
-        assert_eq!(transform_manifest(&manifest_path, false).unwrap().transformed, 1);
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&successful_manifest).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            transform_manifest(&manifest_path, false)
+                .unwrap()
+                .transformed,
+            1
+        );
 
         let error_manifest = TransformManifest {
             output_formats: vec!["unsupported".into()],
@@ -1709,7 +2483,11 @@ mod tests {
             )]),
             ..manifest.clone()
         };
-        fs::write(&manifest_path, serde_json::to_string(&error_manifest).unwrap()).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&error_manifest).unwrap(),
+        )
+        .unwrap();
         assert!(transform_manifest(&manifest_path, false).is_err());
 
         let default_manifest = TransformManifest {
@@ -1717,8 +2495,17 @@ mod tests {
             files: BTreeMap::new(),
             ..manifest
         };
-        fs::write(&manifest_path, serde_json::to_string(&default_manifest).unwrap()).unwrap();
-        assert_eq!(transform_manifest(&manifest_path, false).unwrap().transformed, 0);
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&default_manifest).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            transform_manifest(&manifest_path, false)
+                .unwrap()
+                .transformed,
+            0
+        );
         let parsed: TransformManifest = serde_json::from_str(
             &serde_json::json!({"source_root":"source","output_dir":"output","files":{}})
                 .to_string(),

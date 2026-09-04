@@ -27,8 +27,10 @@ as a compatibility name for existing sustainablefactory workflows.
   for MATLAB.
 - Light scripts use `# +` and `# -`, or the corresponding language prefix.
 - Markdown and raw script cells use `[markdown]` and `[raw]` markers.
-- Python, R, Julia, and MATLAB input extensions are recognized by the file
-  transform API.
+- The language registry recognizes Python, R, Julia, MATLAB, JavaScript,
+  TypeScript, Ruby, shell, Rust, and SQL prefixes and extensions.
+- Input formats are detected from notebook extensions, registered script
+  extensions, and percent markers, with explicit `--from` overrides.
 
 ### Notebook JSON
 
@@ -36,6 +38,14 @@ Existing v4 notebooks can be read and written without dropping notebook
 metadata, cell metadata, attachments, execution counts, outputs, or stable
 cell IDs. Legacy and v3 notebooks are upgraded through `nbformat` when
 possible. JSON output is deterministic for equivalent notebook structures.
+
+### HTML
+
+- `html` produces a deterministic static HTML document for Markdown, raw, and
+  code cell source.
+- Cell source is HTML-escaped; notebook execution and rich MIME output
+  rendering are intentionally deferred to the resource/exporter milestones in
+  `docs/PARITY_PLAN.md`.
 
 ## Library API
 
@@ -51,18 +61,27 @@ let json = notebook_to_json(&notebook)?;
 
 The main entry points are:
 
+- `FormatId`, `ScriptKind`, `FormatDescriptor`, and `language_specs()` for
+  typed format discovery.
+- `Exporter`, `BasicExporter`, `ExportResult`, `ResourceBundle`, and
+  `export_notebook(notebook, format)` for in-memory conversion.
 - `markdown_to_notebook(source, options)`
 - `script_to_notebook(source, format, language)`
 - `notebook_to_markdown(notebook)`
 - `notebook_to_script(notebook, format, language)`
 - `notebook_to_json(notebook)`
 - `transform_file(source, output_base, formats, options)`
+- `transform_file_with_input_format(source, output_base, formats, options,
+  input_format)`
+- `sync_pair(notebook, text, format, options)` for conflict-aware pair
+  synchronization with atomic writes.
 - `transform_manifest(manifest, dry_run)`
 - `load_workflow_config(path)`
 
-`transform_file` accepts output formats such as `myst`, `ipynb`,
+`transform_file` accepts output formats such as `myst`, `ipynb`, `html`,
 `py:percent`, and `py:light`. It returns the paths and format names of the
-files it wrote.
+files it wrote. Format aliases are normalized internally while the requested
+format name is retained in each `TransformOutput`.
 
 ## CLI
 
@@ -76,6 +95,8 @@ Single-file conversion:
 
 ```text
 nbconvertrs document.md --output build/document --out-format=myst,ipynb
+nbconvertrs document.md --output build/document --to py:percent
+nbconvertrs source.txt --from py:percent --output build/document --to ipynb
 ```
 
 Directory conversion:
@@ -91,6 +112,16 @@ the manifest path, output formats, and transform settings:
 nbconvertrs --config docs/_toc.yml
 nbconvertrs --manifest .tmp/workflow/chat-manifest.json --dry-run
 ```
+
+Synchronize one notebook with one text representation. The notebook is the
+positional source and `--output` names the paired text file:
+
+```text
+nbconvertrs note.ipynb --sync --output note.md --to myst
+```
+
+When both files differ, the newer file is used. Equal-timestamp divergence is
+reported as a conflict rather than overwritten automatically.
 
 Workflow mode compares source SHA-256 values, transform fingerprints, and
 output existence before transforming. Successful outputs are written in a
@@ -118,11 +149,14 @@ incremental workflow behavior.
 ## Compatibility notes
 
 This crate implements the supported transform subset in Rust. It does not
-execute notebooks or kernels. It also does not attempt to reproduce every
-Jupytext format, language-specific option, or execution feature. Unsupported
+execute notebooks or kernels, render LaTeX/PDF/slides, or provide Jinja
+templates and nbconvert preprocessors yet. Its static HTML exporter does not
+yet render rich MIME outputs or extract resources. It also does not attempt to
+reproduce every Jupytext format or language-specific option. Unsupported
 output formats return `TransformError::UnsupportedFormat` so callers can
-choose a Python/Jupytext fallback when their workflow requires a broader
-format matrix.
+choose a Python/Jupytext or nbconvert fallback when their workflow requires a
+broader format matrix. The staged implementation roadmap is in
+[`docs/PARITY_PLAN.md`](docs/PARITY_PLAN.md).
 
 ## Citation
 
