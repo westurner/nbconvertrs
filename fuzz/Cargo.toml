@@ -1,0 +1,43 @@
+[package]
+name = "nbconvertrs-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nbconvertrs = { path = ".." }
+serde_json = "1"
+
+[[bin]]
+name = "markdown_to_notebook"
+path = "fuzz_targets/markdown_to_notebook.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "script_to_notebook"
+path = "fuzz_targets/script_to_notebook.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "notebook_json"
+path = "fuzz_targets/notebook_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "export_dispatch"
+path = "fuzz_targets/export_dispatch.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

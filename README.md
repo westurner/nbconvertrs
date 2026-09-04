@@ -166,6 +166,29 @@ The tests cover Markdown/MyST markers, HTML regions, percent and light
 scripts, upstream Jupytext fixtures, notebook preservation, round trips, and
 incremental workflow behavior.
 
+## Fuzzing
+
+The `fuzz/` package contains deterministic libFuzzer targets for the public
+conversion APIs. It is a separate Cargo workspace and is not included in the
+production crate workspace. Install `cargo-fuzz` and a nightly Rust toolchain,
+then run from the fuzz package directory:
+
+```text
+cd fuzz
+cargo +nightly fuzz build
+cargo +nightly fuzz run markdown_to_notebook -- -max_total_time=10
+cargo +nightly fuzz run script_to_notebook -- -max_total_time=10
+cargo +nightly fuzz run notebook_json -- -max_total_time=10
+cargo +nightly fuzz run export_dispatch -- -max_total_time=10
+```
+
+The checked-in corpus covers valid and malformed Markdown, percent and light
+scripts, notebook JSON, metadata, mixed newlines, Unicode, and export format
+dispatch. Expected parse errors are normal fuzz results. A successful parse
+must serialize to valid notebook JSON and remain structurally stable after a
+second parse; a panic or invariant violation produces a minimized artifact in
+`fuzz/artifacts/`. Generated targets and coverage data are ignored by Git.
+
 ## Compatibility notes
 
 This crate implements the supported transform subset in Rust. It does not

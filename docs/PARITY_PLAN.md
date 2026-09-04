@@ -197,9 +197,10 @@ The first target set is:
 The seed corpus is organized by behavior rather than by target: valid minimal
 documents, nested and unterminated fences, marker-like code, YAML metadata,
 legacy/invalid notebook JSON, Unicode and mixed newline input, attachments,
-rich MIME outputs, and oversized-but-bounded text. Corpus entries and crash
-artifacts are retained in the nested repository; generated coverage output and
-build directories are ignored.
+rich MIME outputs, and oversized-but-bounded text. Seed corpus entries are
+retained in the nested repository. Crash artifacts remain local and ignored
+until a minimized input is promoted to a regression seed; generated coverage
+output and build directories are also ignored.
 
 Fuzz targets treat expected parse and unsupported-format errors as normal
 results. They fail only on panics, resource exhaustion, or violated semantic
@@ -211,10 +212,11 @@ minimized crashers. AddressSanitizer and UndefinedBehaviorSanitizer runs are
 optional hardening jobs because the core is safe Rust, but they remain useful
 for native dependencies and future parser integrations.
 
-**Cargo-fuzz exit criteria:** every target builds with `cargo fuzz build`, a
-short smoke run completes for each target, checked-in seed inputs exercise each
-target, and any discovered panic has a regression test or a documented
-accepted deviation before the related parity feature is marked complete.
+**Cargo-fuzz exit criteria:** every target builds with
+`cargo +nightly fuzz build`, a short smoke run completes for each target,
+checked-in seed inputs exercise each target, and any discovered panic has a
+regression test or a documented accepted deviation before the related parity
+feature is marked complete.
 
 ### Phase 1: Stabilize the conversion core
 

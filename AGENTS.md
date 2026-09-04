@@ -53,6 +53,13 @@ cargo llvm-cov --manifest-path Cargo.toml --lib --summary-only
 cargo fmt --all -- --check
 ```
 
+Fuzz-package validation runs from `fuzz/` with a nightly toolchain:
+
+```text
+cargo +nightly fuzz build
+cargo +nightly fuzz run markdown_to_notebook -- -max_total_time=10
+```
+
 For a narrow change, run the smallest relevant test first. Before a commit,
 run the complete focused test suite and confirm coverage output. Coverage work
 should add tests for the behavior represented by uncovered lines rather than
